@@ -11,17 +11,19 @@ type GenerateBody = {
   mode?: "image" | "text";
   prompt?: string;
   image?: string;
+  /** optional multi-view input (up to 8 views) — TRELLIS averages them */
+  images?: string[];
   engine?: EngineId;
   imageModel?: string | null;
   conceptPrompt?: string | null;
   settings?: Partial<GenSettings>;
 };
 
-const MAX_IMAGE_CHARS = 4_200_000; // ~3.1 MB decoded, under Vercel's 4.5 MB body cap
+/** Vercel caps serverless request bodies at 4.5 MB; stay under it in base64 chars. */
+const MAX_TOTAL_IMAGE_CHARS = 4_200_000;
 const DATA_URL = /^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$/;
 
 function encodeMeta(meta: MeshMeta): string {
-  // ASCII-safe header payload.
   return Buffer.from(JSON.stringify(meta), "utf8").toString("base64");
 }
 
@@ -36,34 +38,50 @@ export async function POST(request: Request) {
     const body = await readJsonBody<GenerateBody>(request);
     const mode = body.mode === "text" ? "text" : "image";
     const prompt = (body.prompt ?? "").trim();
-    const engine: EngineId = body.engine === "trellis-text" ? "trellis-text" : body.engine === "image" ? "image" : "pipeline";
+    const engine: EngineId =
+      body.engine === "trellis-text" ? "trellis-text" : body.engine === "image" ? "image" : "pipeline";
+
+    const images = (body.images ?? []).map((entry) => entry.trim()).filter(Boolean);
 
     if (mode === "text") {
       if (prompt.length < 3) return validationError("Describe the object you want to generate.");
       if (prompt.length > 600) return validationError("Keep the prompt under 600 characters.");
     } else {
-      const image = (body.image ?? "").trim();
-      if (!image) return validationError("An input image is required.");
-      if (image.length > MAX_IMAGE_CHARS) {
+      const single = (body.image ?? "").trim();
+      const incoming = images.length > 0 ? images : single ? [single] : [];
+      if (incoming.length === 0) return validationError("An input image is required.");
+      if (incoming.length > 8) return validationError("TRELLIS accepts at most 8 views.");
+
+      const totalChars = incoming.reduce((sum, entry) => sum + entry.length, 0);
+      if (totalChars > MAX_TOTAL_IMAGE_CHARS) {
         return validationError(
-          "That image is too large for a serverless request (max ~3 MB).",
-          "The studio downscales images before upload — try a smaller file or a PNG/JPG screenshot.",
+          "Those images are too large to send through a serverless function (max ~3 MB).",
+          "The studio already fits each upload into a 1024² JPEG — try one view, or a smaller file.",
         );
       }
-      if (!DATA_URL.test(image)) {
-        return validationError("The image must be a base64 data URL (PNG, JPG or WEBP).");
+      for (const entry of incoming) {
+        if (!DATA_URL.test(entry)) {
+          return validationError("Images must be base64 data URLs (PNG, JPG or WEBP).");
+        }
       }
     }
 
-    const { glb, meta } = await generateMesh(
-      mode === "text" ? { mode: "text", prompt } : { mode: "image", image: body.image!.trim(), prompt: prompt || null },
-      body.settings,
-      {
-        engine,
-        imageModel: mode === "image" ? body.imageModel ?? null : null,
-        conceptPrompt: body.conceptPrompt ?? null,
-      },
-    );
+    const single = (body.image ?? "").trim();
+    const input =
+      mode === "text"
+        ? ({ mode: "text", prompt } as const)
+        : ({
+            mode: "image",
+            image: images[0] ?? single,
+            images: images.length > 0 ? images : undefined,
+            prompt: prompt || null,
+          } as const);
+
+    const { glb, meta } = await generateMesh(input, body.settings, {
+      engine,
+      imageModel: mode === "image" ? body.imageModel ?? null : null,
+      conceptPrompt: body.conceptPrompt ?? null,
+    });
 
     const filename = `trellis-${meta.seed || "random"}-${Date.now().toString(36)}.glb`;
 

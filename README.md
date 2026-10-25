@@ -21,9 +21,26 @@ on the server: it is read from the Vercel environment and never shipped to the b
   - **Prompt → concept → 3D** — FLUX paints a centred product shot, TRELLIS lifts it (best quality).
   - **Prompt → 3D** — TRELLIS text-large straight from the prompt (fastest).
   - **Image → 3D** — drop, browse or paste a photo, TRELLIS reconstructs the object.
+- **Inputs are prepared for you** — every upload is fitted to a 1 MP square (TRELLIS's documented
+  sweet spot), and an auto-matte removes the background, a planet, stars and other scenery by keeping the
+  centred object's connected components. The panel shows *exactly* what TRELLIS will see, before you spend a call.
+- **Filters on the reference image** — presets (Studio / Clean cut / Rescue dark / Silhouette / Raw) plus
+  fine-tune sliders for auto-levels, exposure, contrast, saturation, sharpen and backdrop colour. Filters
+  always re-process from the original file (never stacked), run entirely in the browser, and the preview
+  updates to the exact JPEG that will be sent.
+- **Multi-view lifts** — add up to two extra views (front / top / side). TRELLIS averages up to 8 views,
+  which is the single biggest quality win on elongated subjects like ships.
 - **Real 3D viewport** — three.js + PBR environment lighting, orbit/zoom, auto-rotate, ground grid,
   textured / clay / wireframe modes, live triangle + vertex counts.
-- **Download the GLB** — mesh + textures in one file, ready for Blender, Godot, Unity, three.js, Splat viewers…
+- **Multi-format export** (Meshy/Tripo-style) — from the single GLB TRELLIS returns, the studio converts in
+  the browser to **GLB, OBJ, STL, PLY or USDZ** (AR Quick Look), with an optional **35 % low-poly / LOD**
+  decimation via meshoptimizer. No extra API calls.
+- **Turntable PNG capture** — one click saves four 90°-apart viewport renders for docs, marketplaces or a
+  quick contact sheet.
+- **AI prompt enhance** — rewrites a thin prompt (`a starship`) into a shape-first description using a hosted
+  chat NIM (default `meta/llama-3.1-8b-instruct`). If the key is missing, rate-limited or offline, it
+  silently falls back to a local composer that adds form/material/quality words instead of failing the click.
+- **Quality tiers** — Draft 15 / Standard 25 / High 35 sampling steps, Meshy-style.
 - **Tune the sampler** — seed, latent/sparse steps, both CFG scales, plus a concept-model switch.
 - **Session gallery** — every generated asset stays in memory for the tab's lifetime, one click to reload.
 - **Variations** — one button re-runs the same prompt with a fresh seed (⌘/Ctrl + ↵ in the prompt box).
@@ -88,8 +105,10 @@ Node.js route handler.
 | `NVIDIA_API_BASE` | | `https://ai.api.nvidia.com/v1` | Hosted API base |
 | `NVIDIA_NVCF_BASE` | | `https://api.nvcf.nvidia.com/v2/nvcf` | Base used to poll async (HTTP 202) jobs |
 | `NVIDIA_TRELLIS_MODEL` | | `microsoft/trellis` | 3D model behind `/genai/{model}` |
-| `NVIDIA_TRELLIS_INFER_URL` | | — | Point at your **self-hosted** TRELLIS NIM (`http://host:8000/v1/infer`); auth header optional |
+| `NVIDIA_TRELLIS_INFER_URL` | | — | Point at your **self-hosted** TRELLIS NIM (`http://host:8000/v1/infer`); auth header optional. When set, 3D generation works even with no `NVIDIA_API_KEY` (the FLUX concept stage still needs one) |
 | `NVIDIA_IMAGE_MODEL` | | `black-forest-labs/flux.1-schnell` | Concept-render model |
+| `NVIDIA_CHAT_BASE` | | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible base for prompt enhancement |
+| `NVIDIA_ENHANCE_MODEL` | | `meta/llama-3.1-8b-instruct` | Chat model used by **Enhance** |
 | `NVIDIA_MAX_DURATION` | | `300` | Cosmetic; shown in the footer |
 
 ---
@@ -110,6 +129,7 @@ browser ──► /api/generate ──► ai.api.nvidia.com/v1/genai/microsoft/t
 | --- | --- | --- |
 | `GET /api/health` | — | `{ configured, authVariable, trellisModel, imageModel, imageModels, apiBase, maxDurationSeconds }` |
 | `POST /api/concept` | `{ prompt, settings, imageModel }` | `{ image, prompt, rawPrompt, seed, model, elapsedMs }` |
+| `POST /api/enhance` | `{ prompt, offline? }` | `{ prompt, original, model, elapsedMs, offline, addedShapeWords, fallbackReason? }` — always `200`: the LLM path degrades to the offline composer |
 | `POST /api/generate` | `{ mode: "text" \| "image", prompt?, image?, engine, imageModel?, conceptPrompt?, settings }` | binary **GLB** (`model/gltf-binary`) with generation metadata in `X-Trellis-Meta` (base64 JSON) |
 
 TRELLIS request fields map straight to the NIM schema: `mode`, `image`/`prompt`, `seed`,
@@ -129,9 +149,11 @@ components/
   ViewerStage.tsx        viewport shell, toolbar, stats, download
   ThreeViewer.tsx        three.js scene, GLTF parsing, materials
 lib/
-  nim.ts                 server-only NIM client (retries, NVCF polling, error mapping)
+  nim.ts                 server-only NIM client (retries, payload ladder, NVCF polling, prompt enhance)
+  prompts.ts             shared prompt helpers (offline enhancer, concept suffix)
+  export.ts              browser GLB → OBJ/STL/PLY/USDZ + low-poly decimation
   client.ts              browser fetch helpers + header metadata decoding
-  image.ts               upload downscale + background flattening
+  image.ts               upload fitting, background matte, filter presets + pure pixel maths
   types.ts               shared types and formatting helpers
 public/demo.glb          bundled sample asset
 scripts/make-demo-glb.mjs regenerates the sample asset
@@ -154,6 +176,34 @@ scripts/make-demo-glb.mjs regenerates the sample asset
   `NVIDIA_TRELLIS_INFER_URL=http://localhost:8000/v1/infer` to bypass the hosted gateway entirely.
 - If NVIDIA's hosted TRELLIS function is having a bad day (it happens), the studio tells you and points at
   the alternate engine instead of failing silently.
+
+## When NVIDIA says no
+
+The studio reports NVIDIA's own validation text (the `detail` field) in the error card and in
+`console.error`, with the `nvcf-reqid` for support tickets.
+
+| Symptom | Cause | Fix shipped here |
+| --- | --- | --- |
+| `422` / "could not use the request payload" | The hosted gateway validates stricter than the container docs. Extra fields (`mode`, tuned CFG/steps) can be rejected. | Requests start from the documented minimal body (`image`/`prompt` + `seed`) and only add fields you actually changed. On a 400/422 the client retries a set of progressively smaller payloads and reports which one worked. |
+| `422` after touching CFG | `slat_cfg_scale` / `ss_cfg_scale` are `exclusiveMinimum: 1.0`, so `1` is invalid. | Both are clamped to `1.05 … 10` server-side; the sliders can no longer produce an invalid value. |
+| `422` on a big upload | TRELLIS expects ~1 MP. A 597×335 screenshot is 0.2 MP and not square. | Uploads are re-fitted into a 1024² JPEG (upscaling allowed) before sending. |
+| `422`/weird mesh from a scene photo | Background, planet, glows confuse the reconstruction. | Auto-matte keeps the centred object only; toggle it off to send the raw frame. The preview shows the difference. |
+| Dark or busy screenshot lifts badly | Low contrast hides hull detail, and a planet/starfield competes with the subject. | Filter presets + percentile auto-levels + auto-matte. The stretch is 2 %/98 % and skips near-flat images, so it cannot amplify noise. |
+| `504` / "ran past the function time limit" | Vercel stops functions at 60 s on Hobby (300 s on Pro). TRELLIS can take 20–90 s. | The studio retries once automatically at **Fast 15** steps, and the Speed preset lets you pick 15 / 25 / 35 up front. |
+| `429` | Hosted NIM rate limit per model. | One automatic retry with backoff, then a message with a wait hint. |
+| `CONTENT_FILTERED` | Prompt tripped the safety checker. | Surfaced as its own error with rewrite advice. |
+| Enhance came back "expanded locally" | The chat NIM was rate-limited, unreachable, or no key is set. | Intentional: the route returns `200` with `offline: true` and a `fallbackReason` instead of an error. |
+| USDZ export fails | USDZ packaging needs a full canvas/WebGL context. | The menu shows the failure; use GLB or OBJ instead. |
+
+### Prompting 3D subjects (ships, vehicles, props)
+
+- Describe **shape**, not lore: `oval saucer hull, two nacelles on straight angled pylons, glowing blue vents`
+  beats `USS Enterprise NCC-1701`.
+- One object, plain background, three-quarter view, slightly above the horizon — the app appends these
+  constraints to the concept render for you.
+- Names, registry decals, crew, nebulas, "in orbit", "at warp" and explosion effects all hurt.
+- Judge geometry in **Clay** mode, then fix pylon junctions in Blender; those fusions are a property of
+  the model, not a bug in the app.
 
 ## Scripts
 

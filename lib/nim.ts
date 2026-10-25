@@ -8,6 +8,7 @@
  * All models live behind one key: https://build.nvidia.com
  */
 
+import { conceptSuffix } from "./prompts";
 import {
   DEFAULT_SETTINGS,
   type ConceptResponse,
@@ -18,8 +19,12 @@ import {
 
 export const API_BASE = (process.env.NVIDIA_API_BASE || "https://ai.api.nvidia.com/v1").replace(/\/+$/, "");
 const NVCF_BASE = (process.env.NVIDIA_NVCF_BASE || "https://api.nvcf.nvidia.com/v2/nvcf").replace(/\/+$/, "");
+/** OpenAI-compatible hosted base, used for the prompt-enhancement LLM. */
+const CHAT_BASE = (process.env.NVIDIA_CHAT_BASE || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
 
 export const TRELLIS_MODEL = process.env.NVIDIA_TRELLIS_MODEL || "microsoft/trellis";
+/** Small hosted chat model used to rewrite/expand prompts. */
+export const ENHANCE_MODEL = process.env.NVIDIA_ENHANCE_MODEL || "meta/llama-3.1-8b-instruct";
 
 /**
  * Text-to-image NIMs used for the concept render stage. Both are free to call
@@ -56,8 +61,13 @@ export function resolveKey(): { key: string | null; variable: string | null } {
   return { key: null, variable: null };
 }
 
+/** A self-hosted TRELLIS NIM (NVIDIA_TRELLIS_INFER_URL) needs no key. */
+export function isSelfHosted(): boolean {
+  return Boolean(process.env.NVIDIA_TRELLIS_INFER_URL?.trim());
+}
+
 export function isConfigured(): boolean {
-  return resolveKey().key !== null;
+  return resolveKey().key !== null || isSelfHosted();
 }
 
 export class NimError extends Error {
@@ -126,18 +136,42 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
   }
 }
 
-function pickMessage(payload: Record<string, unknown>): string | undefined {
-  const candidates = [payload.detail, payload.message, payload.error, payload.title, payload.raw];
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 400);
-    if (candidate && typeof candidate === "object") {
-      const nested = candidate as Record<string, unknown>;
-      for (const key of ["message", "detail", "error", "description"]) {
-        if (typeof nested[key] === "string" && (nested[key] as string).trim()) {
-          return (nested[key] as string).trim().slice(0, 400);
-        }
-      }
+/** Flatten FastAPI-style `detail: [{ loc, msg, type }]` into a readable string. */
+function describeDetail(detail: unknown): string | undefined {
+  if (typeof detail === "string" && detail.trim()) return detail.trim().slice(0, 600);
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((entry) => {
+        if (!entry || typeof entry !== "object") return String(entry ?? "");
+        const item = entry as Record<string, unknown>;
+        const loc = Array.isArray(item.loc) ? item.loc.join(".") : "";
+        const msg = typeof item.msg === "string" ? item.msg : typeof item.message === "string" ? item.message : "";
+        return [loc, msg].filter(Boolean).join(": ");
+      })
+      .filter(Boolean);
+    if (parts.length > 0) return parts.join(" · ").slice(0, 600);
+  }
+  if (detail && typeof detail === "object") {
+    const nested = detail as Record<string, unknown>;
+    for (const key of ["message", "detail", "error", "description", "msg"]) {
+      const value = nested[key];
+      if (typeof value === "string" && value.trim()) return value.trim().slice(0, 600);
     }
+    try {
+      return JSON.stringify(detail).slice(0, 600);
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+function pickMessage(payload: Record<string, unknown>): string | undefined {
+  for (const candidate of [payload.detail, payload.message, payload.error, payload.title, payload.raw]) {
+    if (candidate === undefined || candidate === null) continue;
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim().slice(0, 600);
+    const described = describeDetail(candidate);
+    if (described) return described;
   }
   return undefined;
 }
@@ -187,6 +221,15 @@ function mapHttpError(status: number, payload: Record<string, unknown>, requestI
       status,
       code: "nim_bad_request",
       hint: "Try a different image / shorter prompt, or reset the advanced sampling settings.",
+      detail,
+      requestId: requestId ?? undefined,
+    });
+  }
+  if (status === 504 || status === 408) {
+    return new NimError("The 3D job ran out of time before it finished.", {
+      status: 504,
+      code: "nim_timeout",
+      hint: "Vercel caps function duration (60s on Hobby, 300s on Pro). Lower the sampling steps in the fast preset, or split the run: generate the image, then lift it.",
       detail,
       requestId: requestId ?? undefined,
     });
@@ -360,32 +403,78 @@ function clamp(value: number, min: number, max: number, fallback: number): numbe
   return Math.min(max, Math.max(min, value));
 }
 
+/** CFG scales are `exclusiveMinimum: 1.0` in the TRELLIS schema — 1 is rejected. */
+export const CFG_MIN = 1.05;
+
 export function normalizeSettings(input?: Partial<GenSettings>): GenSettings {
   const merged = { ...DEFAULTS, ...(input ?? {}) };
+  const round = (value: number) => Math.round(value * 100) / 100;
   return {
     seed: Number.isFinite(merged.seed) && merged.seed > 0 ? Math.floor(clamp(merged.seed, 1, 2_147_483_646, 0)) : 0,
     slatSteps: Math.floor(clamp(merged.slatSteps, 10, 50, DEFAULTS.slatSteps)),
     ssSteps: Math.floor(clamp(merged.ssSteps, 10, 50, DEFAULTS.ssSteps)),
-    slatCfg: clamp(merged.slatCfg, 1, 10, DEFAULTS.slatCfg),
-    ssCfg: clamp(merged.ssCfg, 1, 10, DEFAULTS.ssCfg),
+    slatCfg: round(clamp(merged.slatCfg, CFG_MIN, 10, DEFAULTS.slatCfg)),
+    ssCfg: round(clamp(merged.ssCfg, CFG_MIN, 10, DEFAULTS.ssCfg)),
   };
 }
 
 /** Prompt used for the 2D concept render that TRELLIS lifts into 3D. */
 export function buildConceptPrompt(prompt: string): string {
-  const subject = prompt.trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "");
-  return [
-    subject,
-    "single isolated object, centered, full object visible in frame",
-    "three-quarter front view, slightly above horizon",
-    "plain light neutral studio background, soft even lighting, subtle contact shadow",
-    "clean product render, crisp silhouette, high detail, no text, no watermark, no extra props",
-  ].join(", ");
+  return `${prompt.trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "")}, ${conceptSuffix("three-quarter")}`;
 }
 
 export type MeshInput =
-  | { mode: "image"; image: string; prompt?: string | null }
+  | { mode: "image"; image: string; prompt?: string | null; images?: string[] }
   | { mode: "text"; prompt: string };
+
+type TrellisPayload = Record<string, unknown>;
+
+/**
+ * Build the TRELLIS body.
+ *
+ * The hosted gateway validates more strictly than the container schema
+ * (the reference snippet on build.nvidia.com sends image + seed only), so we
+ * start from the smallest valid body and only add fields the user actually
+ * changed. `mode` is omitted on purpose — NIM infers it from image/prompt.
+ */
+function buildTrellisPayloads(input: MeshInput, settings: GenSettings | null): TrellisPayload[] {
+  const media: TrellisPayload =
+    input.mode === "image"
+      ? { image: input.images && input.images.length > 1 ? input.images : input.image }
+      : { prompt: input.prompt };
+
+  const minimal: TrellisPayload = { ...media, seed: settings?.seed ?? 0 };
+  const variants: TrellisPayload[] = [];
+
+  if (settings) {
+    const tuned: TrellisPayload = { ...minimal };
+    if (settings.slatCfg !== DEFAULT_SETTINGS.slatCfg) tuned.slat_cfg_scale = settings.slatCfg;
+    if (settings.ssCfg !== DEFAULT_SETTINGS.ssCfg) tuned.ss_cfg_scale = settings.ssCfg;
+    if (settings.slatSteps !== DEFAULT_SETTINGS.slatSteps) tuned.slat_sampling_steps = settings.slatSteps;
+    if (settings.ssSteps !== DEFAULT_SETTINGS.ssSteps) tuned.ss_sampling_steps = settings.ssSteps;
+    variants.push(tuned);
+    if (input.mode === "image" && input.images && input.images.length > 1) {
+      variants.push({ ...tuned, multiimage_algo: "multidiffusion" });
+    }
+  }
+
+  variants.push(minimal);
+  // Hosted gateway may not accept an array of views — degrade to the primary.
+  if (input.mode === "image" && input.images && input.images.length > 1) {
+    variants.push({ image: input.image, seed: settings?.seed ?? 0 });
+  }
+  // Last resort: media only, let NIM pick every default.
+  variants.push({ ...media });
+
+  // de-duplicate identical bodies
+  const seen = new Set<string>();
+  return variants.filter((variant) => {
+    const key = JSON.stringify(variant);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 /** TRELLIS image-to-3D / text-to-3D. Returns a binary GLB. */
 export async function generateMesh(
@@ -396,31 +485,52 @@ export async function generateMesh(
   const settings = normalizeSettings(settingsInput);
   const started = Date.now();
 
-  const payload: Record<string, unknown> = {
-    mode: input.mode,
-    seed: settings.seed,
-    slat_cfg_scale: settings.slatCfg,
-    ss_cfg_scale: settings.ssCfg,
-    slat_sampling_steps: settings.slatSteps,
-    ss_sampling_steps: settings.ssSteps,
-  };
-
-  if (input.mode === "image") {
-    payload.image = input.image;
-  } else {
-    payload.prompt = input.prompt;
-  }
-
   // Point this at a self-hosted TRELLIS NIM (…/v1/infer) if you run your own GPU.
   const trellisUrl = process.env.NVIDIA_TRELLIS_INFER_URL?.trim() || `/genai/${TRELLIS_MODEL}`;
   const selfHosted = /^https?:\/\//.test(trellisUrl);
+  const timeoutMs = options.timeoutMs ?? 290_000;
+  const attempts = buildTrellisPayloads(input, settings);
 
-  const { payload: result, requestId } = await callNim(trellisUrl, payload, {
-    timeoutMs: options.timeoutMs ?? 290_000,
-    label: "TRELLIS",
-    retries: 1,
-    allowNoKey: selfHosted,
-  });
+  let result: Record<string, unknown> | null = null;
+  let requestId: string | null = null;
+  const tried: string[] = [];
+
+  for (let index = 0; index < attempts.length; index += 1) {
+    const body = attempts[index];
+    try {
+      const response = await callNim(trellisUrl, body, {
+        timeoutMs,
+        label: "TRELLIS",
+        retries: index === 0 ? 1 : 0,
+        allowNoKey: selfHosted,
+      });
+      result = response.payload;
+      requestId = response.requestId;
+      if (index > 0) tried.push(`accepted with reduced payload (attempt ${index + 1})`);
+      break;
+    } catch (error) {
+      if (!(error instanceof NimError)) throw error;
+      tried.push(`${index + 1}: ${error.status} ${error.detail ?? error.message}`);
+      const schemaProblem = error.status === 400 || error.status === 422;
+      const canRetry = schemaProblem && index < attempts.length - 1;
+      if (!canRetry) {
+        if (schemaProblem) {
+          throw new NimError("NVIDIA NIM rejected the TRELLIS request.", {
+            status: error.status,
+            code: "nim_bad_request",
+            hint: "The payload was rejected at every fallback level. Copy the upstream detail below into a report — it names the exact field.",
+            detail: tried.join(" | "),
+            requestId: error.requestId ?? undefined,
+          });
+        }
+        throw error;
+      }
+    }
+  }
+
+  if (!result) {
+    throw new NimError("TRELLIS request failed.", { status: 502, code: "nim_upstream", detail: tried.join(" | ") });
+  }
 
   const artifact = extractArtifact(result);
   if (!artifact) {
@@ -523,4 +633,60 @@ export async function generateConcept(
     model,
     elapsedMs: Date.now() - started,
   };
+}
+
+/**
+ * Prompt rewriting with a hosted chat NIM (OpenAI-compatible endpoint).
+ * Returns a single-line, model-friendly description of the subject.
+ */
+export async function enhancePrompt(
+  prompt: string,
+  options: { timeoutMs?: number } = {},
+): Promise<{ prompt: string; model: string; elapsedMs: number }> {
+  const started = Date.now();
+  const system = [
+    "You rewrite prompts for a text-to-3D asset generator (Microsoft TRELLIS).",
+    "Given a short description, return ONE line, max 90 words, describing the object itself:",
+    "its form, main parts, materials and colours, as a single isolated object.",
+    "Mention geometry words (hull, saucer, nacelle, pylon, handle, spout, roof, legs) when relevant.",
+    "Never add scenes, background, lighting, camera, mood, brand names, people or text.",
+    "No preamble, no quotes, no lists — output the prompt only.",
+  ].join(" ");
+
+  const { payload } = await callNim(
+    `${CHAT_BASE}/chat/completions`,
+    {
+      model: ENHANCE_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: prompt.slice(0, 600) },
+      ],
+      temperature: 0.7,
+      top_p: 0.9,
+      max_tokens: 220,
+      stream: false,
+    },
+    { timeoutMs: options.timeoutMs ?? 30_000, label: "Prompt enhancer", retries: 1 },
+  );
+
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const message = (choices[0] as Record<string, unknown> | undefined)?.message as Record<string, unknown> | undefined;
+  const content = typeof message?.content === "string" ? message.content : "";
+
+  const cleaned = content
+    .replace(/^```[a-z]*\s*/i, "")
+    .replace(/```$/i, "")
+    .replace(/^["'“”\s]+|["'“”\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (cleaned.length < 8) {
+    throw new NimError("The prompt enhancer returned nothing usable.", {
+      status: 502,
+      code: "enhance_empty",
+      hint: "Try again, or use the offline enhancer (it adds shape and material words locally).",
+    });
+  }
+
+  return { prompt: cleaned.slice(0, 600), model: ENHANCE_MODEL, elapsedMs: Date.now() - started };
 }

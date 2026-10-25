@@ -1,12 +1,21 @@
 "use client";
 
-import { useState } from "react";
-import { ThreeViewer, type DisplayMode, type MeshStats, type ViewerStatus } from "@/components/ThreeViewer";
+import { useRef, useState } from "react";
 import {
+  ThreeViewer,
+  type DisplayMode,
+  type MeshStats,
+  type ViewerApi,
+  type ViewerStatus,
+} from "@/components/ThreeViewer";
+import { EXPORT_FORMATS, exportMesh, saveExport, saveSnapshot, type ExportFormat } from "@/lib/export";
+import {
+  IconCheck,
   IconCube,
   IconDice,
   IconDownload,
   IconGrid,
+  IconImage,
   IconRotate,
   IconSparkles,
   IconSpinner,
@@ -35,7 +44,6 @@ type Props = {
   onShowGridChange: (value: boolean) => void;
   onStats: (stats: MeshStats) => void;
   onViewerStatus: (status: ViewerStatus, message?: string) => void;
-  onDownload: () => void;
   onLoadDemo: () => void;
   onReset: () => void;
   onCancel: () => void;
@@ -69,7 +77,6 @@ export function ViewerStage(props: Props) {
     onShowGridChange,
     onStats,
     onViewerStatus,
-    onDownload,
     onLoadDemo,
     onReset,
     onCancel,
@@ -78,6 +85,64 @@ export function ViewerStage(props: Props) {
   } = props;
 
   const [lightbox, setLightbox] = useState(false);
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>("glb");
+  const [lowPoly, setLowPoly] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  const viewerApi = useRef<ViewerApi | null>(null);
+
+  const runExport = async () => {
+    if (!asset || exporting) return;
+    setExporting(true);
+    setExportError(null);
+    setExportNote(null);
+    try {
+      const result = await exportMesh(asset.url, asset.name, exportFormat, {
+        detail: lowPoly ? 0.35 : 1,
+      });
+      saveExport(result);
+      const formatLabel = EXPORT_FORMATS.find((entry) => entry.id === exportFormat)?.label ?? exportFormat.toUpperCase();
+      setExportNote(`${formatLabel} saved${result.triangles ? ` · ${result.triangles.toLocaleString()} tris` : ""}`);
+      setExportOpen(false);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Export failed.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const captureTurntable = async () => {
+    if (!asset || capturing) return;
+    setCapturing(true);
+    try {
+      const api = viewerApi.current;
+      const shots: string[] = [];
+      const angles = [0, 90, 180, 270];
+      for (const angle of angles) {
+        api?.orbitTo(angle);
+        await new Promise((resolve) => requestAnimationFrame(() => resolve(null)));
+        const shot = api?.snapshot();
+        if (shot) shots.push(shot);
+      }
+      api?.orbitTo(35);
+      if (shots.length === 0) throw new Error("Could not capture the viewport.");
+      if (shots.length === 1) {
+        await saveSnapshot(shots[0], asset.name);
+      } else {
+        for (let index = 0; index < shots.length; index += 1) {
+          await saveSnapshot(shots[index], `${asset.name}-view-${index + 1}`);
+        }
+      }
+      setExportNote(`${shots.length} turntable PNG${shots.length === 1 ? "" : "s"} saved`);
+    } catch (error) {
+      setExportError(error instanceof Error ? error.message : "Capture failed.");
+    } finally {
+      setCapturing(false);
+    }
+  };
   const activeStage = stages.find((stage) => stage.state === "active") ?? stages[stages.length - 1];
   const showEmpty = !asset && !busy;
 
@@ -163,6 +228,7 @@ export function ViewerStage(props: Props) {
           showGrid={showGrid}
           display={display}
           resetToken={resetToken}
+          apiRef={viewerApi}
           onStats={onStats}
           onStatus={onViewerStatus}
         />
@@ -269,14 +335,98 @@ export function ViewerStage(props: Props) {
             <IconDice className="h-3.5 w-3.5" />
             Variation
           </button>
-          <button type="button" className="btn-ghost" onClick={onReset} disabled={!asset}>
+          <button type="button" className="btn-ghost hidden md:inline-flex" onClick={onReset} disabled={!asset}>
             <IconRotate className="h-3.5 w-3.5" />
             Reframe
           </button>
-          <button type="button" className="btn-primary px-3 py-2 text-[12.5px]" onClick={onDownload} disabled={!asset}>
-            <IconDownload className="h-3.5 w-3.5" />
-            Download GLB
+          <button
+            type="button"
+            className="btn-ghost hidden sm:inline-flex"
+            onClick={() => void captureTurntable()}
+            disabled={!asset || capturing}
+            title="Save 4 turntable PNG views"
+          >
+            {capturing ? <IconSpinner className="h-3.5 w-3.5 animate-spin" /> : <IconImage className="h-3.5 w-3.5" />}
+            PNG
           </button>
+
+          <div className="relative">
+            <button
+              type="button"
+              className="btn-primary px-3 py-2 text-[12.5px]"
+              onClick={() => setExportOpen((value) => !value)}
+              disabled={!asset}
+              aria-expanded={exportOpen}
+              aria-haspopup="menu"
+            >
+              <IconDownload className="h-3.5 w-3.5" />
+              Export
+              <span className="mono text-[10px] uppercase opacity-70">
+                {EXPORT_FORMATS.find((entry) => entry.id === exportFormat)?.label}
+              </span>
+            </button>
+
+            {exportOpen && asset ? (
+              <div
+                role="menu"
+                className="glass absolute bottom-[calc(100%+8px)] right-0 z-30 w-[268px] rounded-xl p-2"
+              >
+                <div className="grid gap-0.5">
+                  {EXPORT_FORMATS.map((format) => (
+                    <button
+                      key={format.id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={exportFormat === format.id}
+                      onClick={() => setExportFormat(format.id)}
+                      className="flex items-start gap-2 rounded-lg px-2 py-1.5 text-left transition hover:bg-white/[0.06]"
+                    >
+                      <span className="mt-0.5 w-3 shrink-0 text-lime-glow">
+                        {exportFormat === format.id ? <IconCheck className="h-3 w-3" strokeWidth={3} /> : null}
+                      </span>
+                      <span className="min-w-0">
+                        <span className="mono block text-[11px] font-semibold uppercase tracking-wider text-mist-100">
+                          {format.label}
+                        </span>
+                        <span className="block text-[10px] leading-snug text-mist-500">{format.detail}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                <label className="mt-1.5 flex cursor-pointer items-start gap-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-2 py-1.5">
+                  <input
+                    type="checkbox"
+                    checked={lowPoly}
+                    onChange={(event) => setLowPoly(event.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 accent-lime-glow"
+                  />
+                  <span>
+                    <span className="block text-[11px] font-medium text-mist-100">Low-poly (35 %)</span>
+                    <span className="mono block text-[9.5px] text-mist-500">
+                      LOD export, decimated in your browser
+                    </span>
+                  </span>
+                </label>
+
+                <button
+                  type="button"
+                  className="btn-primary mt-1.5 w-full px-2 py-1.5 text-[12px]"
+                  onClick={() => void runExport()}
+                  disabled={exporting}
+                >
+                  {exporting ? <IconSpinner className="h-3.5 w-3.5 animate-spin" /> : <IconDownload className="h-3.5 w-3.5" />}
+                  {exporting ? (lowPoly ? "Decimating…" : "Converting…") : `Save ${exportFormat.toUpperCase()}`}
+                </button>
+
+                {exportNote ? <p className="mt-1.5 px-1 text-[10px] text-lime-glow/80">{exportNote}</p> : null}
+                {exportError ? <p className="mt-1.5 px-1 text-[10px] text-rose-300">{exportError}</p> : null}
+                <p className="mt-1 px-1 text-[9.5px] leading-snug text-mist-500">
+                  Converted locally from the GLB — no extra API call.
+                </p>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
 

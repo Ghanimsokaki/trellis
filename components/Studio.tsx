@@ -6,8 +6,13 @@ import { HistoryRail } from "@/components/HistoryRail";
 import { ViewerStage } from "@/components/ViewerStage";
 import type { DisplayMode, MeshStats, ViewerStatus } from "@/components/ThreeViewer";
 import { IconCube, IconExternal, IconKey } from "@/components/Icons";
-import { prepareImageFile, type PreparedImage } from "@/lib/image";
-import { ApiFailure, isAbort, requestConcept, requestMesh, slugifyPrompt } from "@/lib/client";
+import {
+  DEFAULT_FILTERS,
+  prepareImageFile,
+  type FilterSettings,
+  type PreparedImage,
+} from "@/lib/image";
+import { ApiFailure, isAbort, requestConcept, requestEnhance, requestMesh, slugifyPrompt } from "@/lib/client";
 import { EXAMPLE_PROMPT } from "@/lib/presets";
 import {
   DEFAULT_SETTINGS,
@@ -71,6 +76,13 @@ export function Studio({ initialHealth }: Props) {
   const [imageModel, setImageModel] = useState(initialHealth.imageModel);
 
   const [image, setImage] = useState<PreparedImage | null>(null);
+  const [rawFile, setRawFile] = useState<File | null>(null);
+  const [extraFiles, setExtraFiles] = useState<File[]>([]);
+  const [extraViews, setExtraViews] = useState<PreparedImage[]>([]);
+  const [filters, setFilters] = useState<FilterSettings>(DEFAULT_FILTERS);
+  const [preparing, setPreparing] = useState(false);
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceHint, setEnhanceHint] = useState<string | null>(null);
   const [imageError, setImageError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
@@ -93,6 +105,7 @@ export function Studio({ initialHealth }: Props) {
   const [toast, setToast] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const inFlightRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const historyRef = useRef<Asset[]>([]);
@@ -149,23 +162,91 @@ export function Studio({ initialHealth }: Props) {
     return nextAsset;
   }, []);
 
+  const prepare = useCallback(async (file: File, nextFilters: FilterSettings) => {
+    setPreparing(true);
+    setImageError(null);
+    try {
+      const prepared = await prepareImageFile(file, { filters: nextFilters });
+      setImage(prepared);
+      return prepared;
+    } catch (fileError) {
+      setImageError(fileError instanceof Error ? fileError.message : "Could not read that image.");
+      return null;
+    } finally {
+      setPreparing(false);
+    }
+  }, []);
+
   const handleFile = useCallback(
     async (file: File) => {
-      setImageError(null);
-      try {
-        const prepared = await prepareImageFile(file);
-        setImage(prepared);
-        setMode("image");
-        setError(null);
-      } catch (fileError) {
-        setImageError(fileError instanceof Error ? fileError.message : "Could not read that image.");
+      setMode("image");
+      setError(null);
+      setRawFile(file);
+      const prepared = await prepare(file, filters);
+      if (prepared && !prepared.matte && filters.matte) {
+        setImageError("Could not separate a clean object — the background is not uniform. Try the Raw preset, or upload the object on a plain background.");
       }
     },
-    [],
+    [filters, prepare],
   );
 
-  const run = useCallback(async (overrides?: Partial<GenSettings>) => {
-    if (busy) return;
+  const handleAddView = useCallback(
+    async (file: File) => {
+      if (extraFiles.length >= 2) return;
+      setImageError(null);
+      try {
+        const prepared = await prepareImageFile(file, { filters });
+        setExtraFiles((previous) => [...previous, file].slice(0, 2));
+        setExtraViews((previous) => [...previous, prepared].slice(0, 2));
+      } catch (viewError) {
+        setImageError(viewError instanceof Error ? viewError.message : "Could not read that view.");
+      }
+    },
+    [extraFiles.length, filters],
+  );
+
+  const handleRemoveView = useCallback((index: number) => {
+    setExtraFiles((previous) => previous.filter((_, position) => position !== index));
+    setExtraViews((previous) => previous.filter((_, position) => position !== index));
+  }, []);
+
+  const reworkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
+  /**
+   * Filters are cheap (a 1 MP tone-map), so re-process from the original file
+   * — debounced — instead of stacking adjustments on an already-filtered canvas.
+   */
+  const handleFiltersChange = useCallback(
+    (patch: Partial<FilterSettings>) => {
+      const next = { ...filtersRef.current, ...patch };
+      setFilters(next);
+      setImageError(null);
+      if (!rawFile) return;
+
+      if (reworkTimer.current) clearTimeout(reworkTimer.current);
+      reworkTimer.current = setTimeout(() => {
+        void prepare(rawFile, next);
+        if (extraFiles.length > 0) {
+          void Promise.all(extraFiles.map((file) => prepareImageFile(file, { filters: next })))
+            .then((prepared) => setExtraViews(prepared))
+            .catch(() => undefined);
+        }
+      }, 140);
+    },
+    [extraFiles, prepare, rawFile],
+  );
+
+  const handlePreset = useCallback(
+    (presetFilters: FilterSettings) => {
+      handleFiltersChange(presetFilters);
+    },
+    [handleFiltersChange],
+  );
+
+  const run = useCallback(async (overrides?: Partial<GenSettings>, attempt = 0) => {
+    if (inFlightRef.current) return;
     const activeSettings: GenSettings = { ...settings, ...(overrides ?? {}) };
     if (!health.configured) {
       setError({
@@ -175,6 +256,13 @@ export function Studio({ initialHealth }: Props) {
       return;
     }
     const trimmed = prompt.trim();
+    if (mode === "prompt" && engine === "pipeline" && !health.hasKey) {
+      setError({
+        message: "The concept render needs a hosted NVIDIA key.",
+        hint: "NVIDIA_API_KEY is missing, so FLUX can't paint the reference. Add the key, or switch the engine to Direct text → 3D (that path can run against your self-hosted TRELLIS).",
+      });
+      return;
+    }
     if (mode === "prompt" && trimmed.length < 3) {
       setError({ message: "Describe what to build first.", hint: "Try one of the example chips above." });
       return;
@@ -187,6 +275,7 @@ export function Studio({ initialHealth }: Props) {
     const plan = buildPlan(mode, engine, imageModel);
     const controller = new AbortController();
     abortRef.current = controller;
+    inFlightRef.current = true;
 
     setError(null);
     setViewerError(null);
@@ -217,6 +306,10 @@ export function Studio({ initialHealth }: Props) {
           : ({
               mode: "image",
               image: imageData!,
+              images:
+                mode === "image" && extraViews.length > 0
+                  ? [imageData!, ...extraViews.map((view) => view.dataUrl)]
+                  : undefined,
               prompt: mode === "prompt" ? trimmed : undefined,
               engine: mode === "image" ? "image" : "pipeline",
               imageModel: conceptResult?.model ?? null,
@@ -226,6 +319,7 @@ export function Studio({ initialHealth }: Props) {
 
       const result = await requestMesh(payload, controller.signal);
       setStages(toStages(plan, plan.length - 1));
+      setSettings((previous) => ({ ...previous, ...activeSettings }));
       commitAsset(result.blob, result.meta, conceptResult?.image ?? imageData);
       setElapsedMs(Date.now() - startedAt);
       notify("Mesh ready — orbit it or download the GLB");
@@ -233,6 +327,14 @@ export function Studio({ initialHealth }: Props) {
       if (isAbort(runError)) {
         setStages((previous) => previous.map((stage) => (stage.state === "active" ? { ...stage, state: "idle" } : stage)));
         notify("Generation cancelled");
+      } else if (runError instanceof ApiFailure && runError.status === 504 && attempt === 0 && activeSettings.slatSteps > 15) {
+        // Vercel killed the function: retry once at 15 steps, which usually fits.
+        notify("Timed out — retrying in Fast mode (15 steps)…");
+        setStages([]);
+        setTimeout(() => {
+          void runRef.current({ slatSteps: 15, ssSteps: 15 }, 1);
+        }, 80);
+        return;
       } else {
         const generationError: GenerationError =
           runError instanceof ApiFailure
@@ -250,9 +352,10 @@ export function Studio({ initialHealth }: Props) {
       if (timerRef.current) clearInterval(timerRef.current);
       timerRef.current = null;
       abortRef.current = null;
+      inFlightRef.current = false;
       setBusy(false);
     }
-  }, [busy, commitAsset, engine, health.configured, image, imageModel, mode, notify, prompt, settings]);
+  }, [busy, commitAsset, engine, health.configured, health.hasKey, image, imageModel, mode, notify, prompt, settings]);
 
   const runRef = useRef(run);
   runRef.current = run;
@@ -266,6 +369,29 @@ export function Studio({ initialHealth }: Props) {
     setSettings((previous) => ({ ...previous, seed: nextSeed }));
     void runRef.current({ seed: nextSeed });
   }, []);
+
+  const handleEnhance = useCallback(async () => {
+    const subject = prompt.trim();
+    if (subject.length < 3 || enhancing) return;
+    setEnhancing(true);
+    setEnhanceHint(null);
+    try {
+      const result = await requestEnhance(subject);
+      setPrompt(result.prompt.slice(0, 600));
+      setEnhanceHint(
+        result.offline
+          ? `Expanded locally${result.fallbackReason ? ` (${result.fallbackReason})` : ""} — review before forging.`
+          : `Rewritten by ${result.model.replace(/^meta\//, "")} in ${(result.elapsedMs / 1000).toFixed(1)}s — review before forging.`,
+      );
+    } catch (enhanceError) {
+      setError({
+        message: enhanceError instanceof Error ? enhanceError.message : "Could not enhance that prompt.",
+        hint: "You can keep writing it yourself — shape words matter more than adjectives.",
+      });
+    } finally {
+      setEnhancing(false);
+    }
+  }, [enhancing, prompt]);
 
   const handleViewerStatus = useCallback((status: ViewerStatus, message?: string) => {
     setViewerStatus(status);
@@ -435,7 +561,13 @@ export function Studio({ initialHealth }: Props) {
               setError(null);
             }}
             prompt={prompt}
-            onPromptChange={setPrompt}
+            onPromptChange={(value) => {
+              setPrompt(value);
+              if (enhanceHint) setEnhanceHint(null);
+            }}
+            onEnhance={() => void handleEnhance()}
+            enhancing={enhancing}
+            enhanceHint={enhanceHint}
             engine={engine}
             onEngineChange={setEngine}
             settings={settings}
@@ -445,8 +577,18 @@ export function Studio({ initialHealth }: Props) {
             onClearImage={() => {
               setImage(null);
               setImageError(null);
+              setRawFile(null);
+              setExtraFiles([]);
+              setExtraViews([]);
             }}
             imageError={imageError}
+            filters={filters}
+            onFiltersChange={handleFiltersChange}
+            onPreset={handlePreset}
+            preparing={preparing}
+            extraViews={extraViews}
+            onAddView={(file) => void handleAddView(file)}
+            onRemoveView={handleRemoveView}
             busy={busy}
             stages={stages}
             elapsedMs={elapsedMs}
@@ -480,7 +622,6 @@ export function Studio({ initialHealth }: Props) {
               onShowGridChange={setShowGrid}
               onStats={setStats}
               onViewerStatus={handleViewerStatus}
-              onDownload={() => downloadAsset()}
               onLoadDemo={() => void loadDemo()}
               onReset={() => setResetToken((token) => token + 1)}
               onCancel={cancel}
@@ -592,7 +733,11 @@ function SiteHeader({ health }: { health: HealthResponse }) {
             title={health.configured ? "The server can sign NIM requests" : "Add NVIDIA_API_KEY to enable generation"}
           >
             <span className={`h-1.5 w-1.5 rounded-full ${health.configured ? "bg-lime-glow" : "bg-amber-300"}`} />
-            {health.configured ? `${health.authVariable ?? "NVIDIA_API_KEY"} linked` : "key missing"}
+            {health.configured
+              ? health.selfHosted && !health.hasKey
+                ? "self-hosted NIM"
+                : `${health.authVariable ?? "NVIDIA_API_KEY"} linked`
+              : "key missing"}
           </span>
           <a
             className="btn-ghost hidden sm:inline-flex"

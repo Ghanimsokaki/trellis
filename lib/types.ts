@@ -51,6 +51,8 @@ export type ConceptResponse = {
 
 export type HealthResponse = {
   configured: boolean;
+  hasKey: boolean;
+  selfHosted: boolean;
   authVariable: string | null;
   trellisModel: string;
   imageModel: string;
