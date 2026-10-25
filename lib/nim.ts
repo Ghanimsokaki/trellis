@@ -19,6 +19,8 @@ import {
 
 export const API_BASE = (process.env.NVIDIA_API_BASE || "https://ai.api.nvidia.com/v1").replace(/\/+$/, "");
 const NVCF_BASE = (process.env.NVIDIA_NVCF_BASE || "https://api.nvcf.nvidia.com/v2/nvcf").replace(/\/+$/, "");
+/** NVCF asset storage, used to hand images to hosted functions. */
+const ASSETS_BASE = (process.env.NVIDIA_ASSETS_BASE || "https://api.nvcf.nvidia.com/v2/nvcf/assets").replace(/\/+$/, "");
 /** OpenAI-compatible hosted base, used for the prompt-enhancement LLM. */
 const CHAT_BASE = (process.env.NVIDIA_CHAT_BASE || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
 
@@ -293,7 +295,7 @@ async function pollNvcf(requestId: string, key: string, deadline: number, label:
 async function callNim(
   path: string,
   body: Record<string, unknown>,
-  options: { timeoutMs: number; label: string; retries?: number; allowNoKey?: boolean },
+  options: { timeoutMs: number; label: string; retries?: number; allowNoKey?: boolean; headers?: Record<string, string> },
 ): Promise<{ payload: Record<string, unknown>; requestId: string | null }> {
   const { key } = resolveKey();
   if (!key && !options.allowNoKey) {
@@ -317,6 +319,7 @@ async function callNim(
           ...(key ? { Authorization: `Bearer ${key}` } : {}),
           Accept: "application/json",
           "Content-Type": "application/json",
+          ...(options.headers ?? {}),
         },
         body: JSON.stringify(body),
       },
@@ -429,58 +432,167 @@ export type MeshInput =
 
 type TrellisPayload = Record<string, unknown>;
 
+type ImageRef = { mime: string; base64: string };
+
+function parseDataUrl(value: string): ImageRef | null {
+  const match = /^data:(image\/[a-z+.-]+);base64,([A-Za-z0-9+/=\s]+)$/i.exec(value.trim());
+  if (!match) return null;
+  return { mime: match[1].toLowerCase(), base64: match[2].replace(/\s+/g, "") };
+}
+
 /**
- * Build the TRELLIS body.
+ * Upload an image to NVCF asset storage.
  *
- * The hosted gateway validates more strictly than the container schema
- * (the reference snippet on build.nvidia.com sends image + seed only), so we
- * start from the smallest valid body and only add fields the user actually
- * changed. `mode` is omitted on purpose — NIM infers it from image/prompt.
+ * Hosted functions other than the small-inline case require assets: POST to the
+ * assets API for a presigned URL, PUT the bytes, then reference the returned id
+ * with `NVCF-INPUT-ASSET-REFERENCES`. This is the documented path for any image
+ * that does not fit inline (~180 KB) and the only path the hosted TRELLIS
+ * gateway accepts for some accounts — it rejects `;base64,` with
+ * "Expected: example_id, got: base64".
  */
-function buildTrellisPayloads(input: MeshInput, settings: GenSettings | null): TrellisPayload[] {
+async function uploadAsset(
+  data: Uint8Array,
+  mime: string,
+  options: { timeoutMs?: number } = {},
+): Promise<{ assetId: string; bytes: number }> {
+  const { key } = resolveKey();
+  if (!key) {
+    throw new NimError("An API key is required to upload the image as an NVCF asset.", {
+      status: 500,
+      code: "nim_missing_key",
+    });
+  }
+
+  const createResponse = await fetchWithTimeout(
+    ASSETS_BASE,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ contentType: mime, description: "Trellis Forge reference image" }),
+    },
+    options.timeoutMs ?? 30_000,
+  );
+
+  const created = await readJson(createResponse);
+  if (!createResponse.ok) {
+    throw mapHttpError(createResponse.status, created, createResponse.headers.get("nvcf-reqid"), "Asset upload");
+  }
+
+  const assetId = typeof created.assetId === "string" ? created.assetId : null;
+  const uploadUrl = typeof created.uploadUrl === "string" ? created.uploadUrl : null;
+  if (!assetId || !uploadUrl) {
+    throw new NimError("NVIDIA's asset service did not return an upload URL.", {
+      status: 502,
+      code: "asset_create_failed",
+      detail: JSON.stringify(created).slice(0, 300),
+    });
+  }
+
+  const putResponse = await fetchWithTimeout(
+    uploadUrl,
+    {
+      method: "PUT",
+      headers: {
+        "x-amz-meta-nvcf-asset-description": "Trellis Forge reference image",
+        "content-type": mime,
+      },
+      body: new Uint8Array(data),
+    },
+    options.timeoutMs ?? 60_000,
+  );
+
+  if (!putResponse.ok) {
+    throw new NimError("Uploading the image to NVIDIA's asset store failed.", {
+      status: 502,
+      code: "asset_put_failed",
+      hint: "Retry — presigned URLs expire quickly. If it persists, use a smaller image.",
+      detail: `HTTP ${putResponse.status} from the presigned URL`,
+    });
+  }
+
+  return { assetId, bytes: data.byteLength };
+}
+
+/** Base URL of NVCF asset storage (reported by /api/health). */
+export const ASSETS_API_BASE = ASSETS_BASE;
+
+/**
+ * How the image is referenced for a hosted TRELLIS call.
+ * `NVIDIA_TRELLIS_IMAGE_REF` can force one: auto | asset | base64.
+ */
+function hostedImageRefMode(): "auto" | "asset" | "base64" {
+  const value = (process.env.NVIDIA_TRELLIS_IMAGE_REF || "auto").toLowerCase();
+  if (value === "asset" || value === "base64") return value;
+  return "auto";
+}
+
+/**
+ * Build one TRELLIS body.
+ *
+ * The hosted gateway validates more strictly than the container schema (the
+ * reference snippet on build.nvidia.com sends image + seed only), so the body
+ * stays minimal and only carries fields the user actually changed. `mode` is
+ * omitted on purpose — NIM infers it from image/prompt.
+ */
+function buildTrellisPayload(input: MeshInput, settings: GenSettings | null): TrellisPayload {
   const media: TrellisPayload =
     input.mode === "image"
       ? { image: input.images && input.images.length > 1 ? input.images : input.image }
       : { prompt: input.prompt };
 
-  const minimal: TrellisPayload = { ...media, seed: settings?.seed ?? 0 };
-  const variants: TrellisPayload[] = [];
+  const body: TrellisPayload = { ...media, seed: settings?.seed ?? 0 };
+  if (!settings) return body;
 
-  if (settings) {
-    const tuned: TrellisPayload = { ...minimal };
-    if (settings.slatCfg !== DEFAULT_SETTINGS.slatCfg) tuned.slat_cfg_scale = settings.slatCfg;
-    if (settings.ssCfg !== DEFAULT_SETTINGS.ssCfg) tuned.ss_cfg_scale = settings.ssCfg;
-    if (settings.slatSteps !== DEFAULT_SETTINGS.slatSteps) tuned.slat_sampling_steps = settings.slatSteps;
-    if (settings.ssSteps !== DEFAULT_SETTINGS.ssSteps) tuned.ss_sampling_steps = settings.ssSteps;
-    variants.push(tuned);
-    if (input.mode === "image" && input.images && input.images.length > 1) {
-      variants.push({ ...tuned, multiimage_algo: "multidiffusion" });
-    }
+  if (settings.slatCfg !== DEFAULT_SETTINGS.slatCfg) body.slat_cfg_scale = settings.slatCfg;
+  if (settings.ssCfg !== DEFAULT_SETTINGS.ssCfg) body.ss_cfg_scale = settings.ssCfg;
+  if (settings.slatSteps !== DEFAULT_SETTINGS.slatSteps) body.slat_sampling_steps = settings.slatSteps;
+  if (settings.ssSteps !== DEFAULT_SETTINGS.ssSteps) body.ss_sampling_steps = settings.ssSteps;
+  if (input.mode === "image" && input.images && input.images.length > 1) body.multiimage_algo = "multidiffusion";
+
+  return body;
+}
+
+/** Turn a schema rejection on the final rung into something a human can act on. */
+function rejectionError(mode: "text" | "image", error: NimError, trail: string[]): NimError {
+  const wantsExample = /example_id/i.test(error.detail ?? "");
+  const detail = trail.join(" | ");
+
+  if (mode === "text") {
+    return new NimError("NVIDIA rejected the text prompt.", {
+      status: error.status,
+      code: "nim_prompt_rejected",
+      hint: wantsExample
+        ? "This hosted TRELLIS function only accepts catalog examples (`example_id`) on some accounts, so free-form prompts are refused. Run your own TRELLIS NIM, or use the Image → 3D tab with a reference picture."
+        : "Shorten the prompt and retry, or switch to Image → 3D with a reference picture.",
+      detail,
+      requestId: error.requestId ?? undefined,
+    });
   }
 
-  variants.push(minimal);
-  // Hosted gateway may not accept an array of views — degrade to the primary.
-  if (input.mode === "image" && input.images && input.images.length > 1) {
-    variants.push({ image: input.image, seed: settings?.seed ?? 0 });
-  }
-  // Last resort: media only, let NIM pick every default.
-  variants.push({ ...media });
-
-  // de-duplicate identical bodies
-  const seen = new Set<string>();
-  return variants.filter((variant) => {
-    const key = JSON.stringify(variant);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+  return new NimError("NVIDIA rejected every way of sending that image.", {
+    status: error.status,
+    code: "nim_image_rejected",
+    hint: wantsExample
+      ? "The hosted TRELLIS function is asking for a catalog example (`example_id`), which means this account is not accepting user images. Try the Prompt → Direct text → 3D tab, run your own TRELLIS NIM via NVIDIA_TRELLIS_INFER_URL, or use the build.nvidia.com playground."
+      : "Try a smaller image, the Direct text → 3D engine, or a self-hosted TRELLIS NIM (NVIDIA_TRELLIS_INFER_URL).",
+    detail,
+    requestId: error.requestId ?? undefined,
   });
 }
 
-/** TRELLIS image-to-3D / text-to-3D. Returns a binary GLB. */
 export async function generateMesh(
   input: MeshInput,
   settingsInput: Partial<GenSettings> | undefined,
-  options: { engine: EngineId; imageModel?: string | null; conceptPrompt?: string | null; timeoutMs?: number },
+  options: {
+    engine: EngineId;
+    imageModel?: string | null;
+    conceptPrompt?: string | null;
+    timeoutMs?: number;
+  },
 ): Promise<{ glb: Uint8Array; meta: MeshMeta }> {
   const settings = normalizeSettings(settingsInput);
   const started = Date.now();
@@ -489,41 +601,104 @@ export async function generateMesh(
   const trellisUrl = process.env.NVIDIA_TRELLIS_INFER_URL?.trim() || `/genai/${TRELLIS_MODEL}`;
   const selfHosted = /^https?:\/\//.test(trellisUrl);
   const timeoutMs = options.timeoutMs ?? 290_000;
-  const attempts = buildTrellisPayloads(input, settings);
+
+  type Attempt = { body: TrellisPayload; headers?: Record<string, string>; label: string };
+  const attempts: Attempt[] = [];
+  const notes: string[] = [];
+
+  if (input.mode === "image") {
+    const sources = input.images && input.images.length > 1 ? input.images : [input.image];
+    const refs = sources
+      .map(parseDataUrl)
+      .filter((entry): entry is ImageRef => entry !== null);
+    const refMode = hostedImageRefMode();
+    const inline = { body: buildTrellisPayload(input, settings), label: "inline base64" };
+
+    if (selfHosted || refMode === "base64" || refs.length === 0) {
+      // Local NIM containers take inline base64; so does the last-ditch attempt.
+      attempts.push(inline);
+    } else {
+      // Hosted: upload to NVCF asset storage, then reference the ids. This is the
+      // only shape the hosted gateway reliably accepts — inline base64 gets
+      // "Expected: example_id, got: base64" for anything past the tiny-image case.
+      const uploaded: { assetId: string; mime: string }[] = [];
+      for (const ref of refs) {
+        try {
+          const bytes = new Uint8Array(Buffer.from(ref.base64, "base64"));
+          const asset = await uploadAsset(bytes, ref.mime, { timeoutMs: 90_000 });
+          uploaded.push({ assetId: asset.assetId, mime: ref.mime });
+          notes.push(`asset ${asset.assetId} (${Math.round(asset.bytes / 1024)} KB ${ref.mime})`);
+        } catch (error) {
+          const reason =
+            error instanceof NimError ? `${error.message}${error.detail ? ` — ${error.detail}` : ""}` : "unknown error";
+          notes.push(`asset upload failed: ${reason}`);
+          break;
+        }
+      }
+
+      if (uploaded.length === refs.length && uploaded.length > 0) {
+        const ids = uploaded.map((entry) => entry.assetId).join(",");
+        const headers = { "NVCF-INPUT-ASSET-REFERENCES": ids };
+        const assetUrls = uploaded.map((entry) => `data:${entry.mime};asset_id,${entry.assetId}`);
+        const assetMedia = assetUrls.length > 1 ? assetUrls : assetUrls[0];
+
+        attempts.push({
+          body: {
+            image: assetMedia,
+            seed: settings.seed,
+            ...(uploaded.length > 1 ? { multiimage_algo: "multidiffusion" } : {}),
+          },
+          headers,
+          label: `asset reference (${uploaded.length} view${uploaded.length > 1 ? "s" : ""})`,
+        });
+        if (uploaded.length === 1) {
+          attempts.push({ body: { image: uploaded[0].assetId, seed: settings.seed }, headers, label: "bare asset id" });
+        }
+      }
+
+      attempts.push(inline);
+    }
+  } else {
+    attempts.push({ body: buildTrellisPayload(input, settings), label: "text prompt" });
+  }
+
+  // De-duplicate identical bodies+headers.
+  const seen = new Set<string>();
+  const unique = attempts.filter((attempt) => {
+    const key = JSON.stringify([attempt.body, attempt.headers ?? {}]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 
   let result: Record<string, unknown> | null = null;
   let requestId: string | null = null;
+  let imageRef: "asset" | "inline" | undefined = undefined;
   const tried: string[] = [];
 
-  for (let index = 0; index < attempts.length; index += 1) {
-    const body = attempts[index];
+  for (let index = 0; index < unique.length; index += 1) {
+    const attempt = unique[index];
     try {
-      const response = await callNim(trellisUrl, body, {
+      const response = await callNim(trellisUrl, attempt.body, {
         timeoutMs,
         label: "TRELLIS",
         retries: index === 0 ? 1 : 0,
         allowNoKey: selfHosted,
+        headers: attempt.headers,
       });
       result = response.payload;
       requestId = response.requestId;
-      if (index > 0) tried.push(`accepted with reduced payload (attempt ${index + 1})`);
+      imageRef = attempt.label.startsWith("asset") || attempt.label === "bare asset id" ? "asset" : "inline";
+      if (index > 0) tried.push(`accepted via ${attempt.label}`);
       break;
     } catch (error) {
       if (!(error instanceof NimError)) throw error;
-      tried.push(`${index + 1}: ${error.status} ${error.detail ?? error.message}`);
+      tried.push(`${index + 1}/${unique.length} ${attempt.label}: ${error.status} ${error.detail ?? error.message}`);
       const schemaProblem = error.status === 400 || error.status === 422;
-      const canRetry = schemaProblem && index < attempts.length - 1;
-      if (!canRetry) {
-        if (schemaProblem) {
-          throw new NimError("NVIDIA NIM rejected the TRELLIS request.", {
-            status: error.status,
-            code: "nim_bad_request",
-            hint: "The payload was rejected at every fallback level. Copy the upstream detail below into a report — it names the exact field.",
-            detail: tried.join(" | "),
-            requestId: error.requestId ?? undefined,
-          });
-        }
-        throw error;
+      if (!schemaProblem) throw error;
+      // The last rung: explain what the gateway actually wants.
+      if (index === unique.length - 1) {
+        throw rejectionError(input.mode, error, [...notes, ...tried]);
       }
     }
   }
@@ -569,6 +744,7 @@ export async function generateMesh(
     bytes: bytes.byteLength,
     requestId: requestId ?? null,
     createdAt: new Date().toISOString(),
+    ...(input.mode === "image" && imageRef ? { imageRef } : {}),
   };
 
   return { glb: bytes, meta };

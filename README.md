@@ -104,6 +104,8 @@ Node.js route handler.
 | `NVIDIA_API_KEY` | ✅ | — | Hosted NIM key (`nvapi-…`). Aliases: `NVIDIA_NIM_API_KEY`, `NIM_API_KEY`. |
 | `NVIDIA_API_BASE` | | `https://ai.api.nvidia.com/v1` | Hosted API base |
 | `NVIDIA_NVCF_BASE` | | `https://api.nvcf.nvidia.com/v2/nvcf` | Base used to poll async (HTTP 202) jobs |
+| `NVIDIA_ASSETS_BASE` | | `https://api.nvcf.nvidia.com/v2/nvcf/assets` | NVCF asset storage used to hand reference images to the hosted function |
+| `NVIDIA_TRELLIS_IMAGE_REF` | | `auto` | `auto` uploads every reference image as an NVCF asset; `base64` forces inline data URLs (only for local NIM containers); `asset` is the same as auto |
 | `NVIDIA_TRELLIS_MODEL` | | `microsoft/trellis` | 3D model behind `/genai/{model}` |
 | `NVIDIA_TRELLIS_INFER_URL` | | — | Point at your **self-hosted** TRELLIS NIM (`http://host:8000/v1/infer`); auth header optional. When set, 3D generation works even with no `NVIDIA_API_KEY` (the FLUX concept stage still needs one) |
 | `NVIDIA_IMAGE_MODEL` | | `black-forest-labs/flux.1-schnell` | Concept-render model |
@@ -171,7 +173,12 @@ scripts/make-demo-glb.mjs regenerates the sample asset
   not scenes; text-to-3D (direct) is noticeably weaker than image-conditioned generation.
 - **Trial terms.** Hosted NIM calls are governed by the NVIDIA API Trial Terms of Service and the model's
   license (TRELLIS: MIT / NVIDIA Community Model License). Production use requires NVIDIA AI Enterprise.
-- **No storage.** Generated meshes live only in the browser tab; nothing is uploaded to a third-party bucket.
+- **Reference images go through NVCF assets.** Hosted functions cap inline base64 at roughly 180 KB, and the
+  hosted TRELLIS gateway rejects oversized data URLs with `Expected: example_id, got: base64`. Every upload is
+  therefore pushed to NVIDIA's own asset store first (`POST /v2/nvcf/assets` → presigned `PUT`) and sent as
+  `data:image/jpeg;asset_id,<uuid>` with an `NVCF-INPUT-ASSET-REFERENCES` header. Self-hosted containers keep
+  using plain base64. Assets are NVIDIA-managed and short-lived; nothing touches a third-party bucket.
+- **No storage.** Generated meshes live only in the browser tab.
 - **Self-hosting.** With an NGC key you can run the TRELLIS NIM container on your own GPU and set
   `NVIDIA_TRELLIS_INFER_URL=http://localhost:8000/v1/infer` to bypass the hosted gateway entirely.
 - If NVIDIA's hosted TRELLIS function is having a bad day (it happens), the studio tells you and points at
@@ -186,6 +193,7 @@ The studio reports NVIDIA's own validation text (the `detail` field) in the erro
 | --- | --- | --- |
 | `422` / "could not use the request payload" | The hosted gateway validates stricter than the container docs. Extra fields (`mode`, tuned CFG/steps) can be rejected. | Requests start from the documented minimal body (`image`/`prompt` + `seed`) and only add fields you actually changed. On a 400/422 the client retries a set of progressively smaller payloads and reports which one worked. |
 | `422` after touching CFG | `slat_cfg_scale` / `ss_cfg_scale` are `exclusiveMinimum: 1.0`, so `1` is invalid. | Both are clamped to `1.05 … 10` server-side; the sliders can no longer produce an invalid value. |
+| `422` `Expected: example_id, got: base64` | The hosted gateway wants an NVCF asset reference, not an inline data URL (or the function only exposes catalog examples for that account). | Images are uploaded to NVCF asset storage automatically and referenced by id; if the gateway still refuses, the error card explains the three escape hatches (self-host, Direct text → 3D, playground). |
 | `422` on a big upload | TRELLIS expects ~1 MP. A 597×335 screenshot is 0.2 MP and not square. | Uploads are re-fitted into a 1024² JPEG (upscaling allowed) before sending. |
 | `422`/weird mesh from a scene photo | Background, planet, glows confuse the reconstruction. | Auto-matte keeps the centred object only; toggle it off to send the raw frame. The preview shows the difference. |
 | Dark or busy screenshot lifts badly | Low contrast hides hull detail, and a planet/starfield competes with the subject. | Filter presets + percentile auto-levels + auto-matte. The stretch is 2 %/98 % and skips near-flat images, so it cannot amplify noise. |
