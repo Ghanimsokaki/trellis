@@ -15,11 +15,12 @@ type Props = {
   showGrid: boolean;
   display: DisplayMode;
   resetToken?: number;
+  apiRef?: React.MutableRefObject<ViewerApi | null>;
   onStats?: (stats: MeshStats) => void;
   onStatus?: (status: ViewerStatus, message?: string) => void;
 };
 
-type ViewerApi = {
+export type ViewerApi = {
   load: (url: string) => Promise<void>;
   clear: () => void;
   setAutoRotate: (value: boolean) => void;
@@ -27,14 +28,27 @@ type ViewerApi = {
   setDisplay: (value: DisplayMode) => void;
   reset: () => void;
   dispose: () => void;
+  /** PNG data URL of the current frame (transparent background) */
+  snapshot: () => string | null;
+  /** rotate to a fixed angle in degrees, for turntable captures */
+  orbitTo: (degrees: number) => void;
 };
 
-export function ThreeViewer({ url, autoRotate, showGrid, display, resetToken, onStats, onStatus }: Props) {
+export function ThreeViewer({
+  url,
+  autoRotate,
+  showGrid,
+  display,
+  resetToken,
+  apiRef: externalApiRef,
+  onStats,
+  onStatus,
+}: Props) {
   const mountRef = useRef<HTMLDivElement | null>(null);
-  const apiRef = useRef<ViewerApi | null>(null);
+  const localApiRef = useRef<ViewerApi | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
-  const propsRef = useRef({ url, autoRotate, showGrid, display, onStats, onStatus });
-  propsRef.current = { url, autoRotate, showGrid, display, onStats, onStatus };
+  const propsRef = useRef({ url, autoRotate, showGrid, display, apiRef: externalApiRef, onStats, onStatus });
+  propsRef.current = { url, autoRotate, showGrid, display, apiRef: externalApiRef, onStats, onStatus };
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -335,6 +349,27 @@ export function ThreeViewer({ url, autoRotate, showGrid, display, resetToken, on
           },
           setDisplay: (value) => applyDisplay(value),
           reset: () => frameContent(),
+          snapshot: () => {
+            try {
+              renderer.render(scene, camera);
+              return renderer.domElement.toDataURL("image/png");
+            } catch {
+              return null;
+            }
+          },
+          orbitTo: (degrees: number) => {
+            const radius = camera.position.distanceTo(controls.target);
+            const phi = Math.acos(THREE.MathUtils.clamp((camera.position.y - controls.target.y) / radius, -1, 1));
+            const theta = (degrees * Math.PI) / 180;
+            camera.position.set(
+              controls.target.x + radius * Math.sin(phi) * Math.sin(theta),
+              controls.target.y + radius * Math.cos(phi),
+              controls.target.z + radius * Math.sin(phi) * Math.cos(theta),
+            );
+            camera.lookAt(controls.target);
+            controls.update();
+            renderer.render(scene, camera);
+          },
           dispose: () => {
             loadToken += 1;
             cancelAnimationFrame(raf);
@@ -363,7 +398,8 @@ export function ThreeViewer({ url, autoRotate, showGrid, display, resetToken, on
           },
         };
 
-        apiRef.current = api;
+        localApiRef.current = api;
+        if (propsRef.current.apiRef) propsRef.current.apiRef.current = api;
         api.setAutoRotate(propsRef.current.autoRotate);
         api.setGrid(propsRef.current.showGrid);
         applyDisplay(propsRef.current.display);
@@ -413,28 +449,29 @@ export function ThreeViewer({ url, autoRotate, showGrid, display, resetToken, on
       cancelAnimationFrame(raf);
       api?.dispose();
       api = null;
-      apiRef.current = null;
+      localApiRef.current = null;
+      if (propsRef.current.apiRef) propsRef.current.apiRef.current = null;
     };
   }, []);
 
   useEffect(() => {
-    apiRef.current?.setAutoRotate(autoRotate);
+    localApiRef.current?.setAutoRotate(autoRotate);
   }, [autoRotate]);
 
   useEffect(() => {
-    apiRef.current?.setGrid(showGrid);
+    localApiRef.current?.setGrid(showGrid);
   }, [showGrid]);
 
   useEffect(() => {
-    apiRef.current?.setDisplay(display);
+    localApiRef.current?.setDisplay(display);
   }, [display]);
 
   useEffect(() => {
-    apiRef.current?.reset();
+    localApiRef.current?.reset();
   }, [resetToken]);
 
   useEffect(() => {
-    const api = apiRef.current;
+    const api = localApiRef.current;
     if (!api) return;
     if (!url) {
       api.clear();

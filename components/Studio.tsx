@@ -12,7 +12,7 @@ import {
   type FilterSettings,
   type PreparedImage,
 } from "@/lib/image";
-import { ApiFailure, isAbort, requestConcept, requestMesh, slugifyPrompt } from "@/lib/client";
+import { ApiFailure, isAbort, requestConcept, requestEnhance, requestMesh, slugifyPrompt } from "@/lib/client";
 import { EXAMPLE_PROMPT } from "@/lib/presets";
 import {
   DEFAULT_SETTINGS,
@@ -81,6 +81,8 @@ export function Studio({ initialHealth }: Props) {
   const [extraViews, setExtraViews] = useState<PreparedImage[]>([]);
   const [filters, setFilters] = useState<FilterSettings>(DEFAULT_FILTERS);
   const [preparing, setPreparing] = useState(false);
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceHint, setEnhanceHint] = useState<string | null>(null);
   const [imageError, setImageError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
@@ -368,6 +370,29 @@ export function Studio({ initialHealth }: Props) {
     void runRef.current({ seed: nextSeed });
   }, []);
 
+  const handleEnhance = useCallback(async () => {
+    const subject = prompt.trim();
+    if (subject.length < 3 || enhancing) return;
+    setEnhancing(true);
+    setEnhanceHint(null);
+    try {
+      const result = await requestEnhance(subject);
+      setPrompt(result.prompt.slice(0, 600));
+      setEnhanceHint(
+        result.offline
+          ? `Expanded locally${result.fallbackReason ? ` (${result.fallbackReason})` : ""} — review before forging.`
+          : `Rewritten by ${result.model.replace(/^meta\//, "")} in ${(result.elapsedMs / 1000).toFixed(1)}s — review before forging.`,
+      );
+    } catch (enhanceError) {
+      setError({
+        message: enhanceError instanceof Error ? enhanceError.message : "Could not enhance that prompt.",
+        hint: "You can keep writing it yourself — shape words matter more than adjectives.",
+      });
+    } finally {
+      setEnhancing(false);
+    }
+  }, [enhancing, prompt]);
+
   const handleViewerStatus = useCallback((status: ViewerStatus, message?: string) => {
     setViewerStatus(status);
     setViewerError(status === "error" ? message ?? "The mesh could not be previewed." : null);
@@ -536,7 +561,13 @@ export function Studio({ initialHealth }: Props) {
               setError(null);
             }}
             prompt={prompt}
-            onPromptChange={setPrompt}
+            onPromptChange={(value) => {
+              setPrompt(value);
+              if (enhanceHint) setEnhanceHint(null);
+            }}
+            onEnhance={() => void handleEnhance()}
+            enhancing={enhancing}
+            enhanceHint={enhanceHint}
             engine={engine}
             onEngineChange={setEngine}
             settings={settings}
@@ -591,7 +622,6 @@ export function Studio({ initialHealth }: Props) {
               onShowGridChange={setShowGrid}
               onStats={setStats}
               onViewerStatus={handleViewerStatus}
-              onDownload={() => downloadAsset()}
               onLoadDemo={() => void loadDemo()}
               onReset={() => setResetToken((token) => token + 1)}
               onCancel={cancel}

@@ -40,6 +40,9 @@ type Props = {
   onModeChange: (mode: Mode) => void;
   prompt: string;
   onPromptChange: (value: string) => void;
+  onEnhance: () => void;
+  enhancing: boolean;
+  enhanceHint: string | null;
   engine: EngineChoice;
   onEngineChange: (engine: EngineChoice) => void;
   settings: GenSettings;
@@ -69,9 +72,9 @@ type Props = {
 };
 
 const STEPS_PRESETS = [
-  { label: "Fast 15", steps: 15, detail: "Fits Vercel Hobby's 60s function limit" },
-  { label: "Balanced 25", steps: 25, detail: "Default quality" },
-  { label: "Deep 35", steps: 35, detail: "Slower, finer detail — needs Vercel Pro" },
+  { label: "Draft 15", steps: 15, detail: "Fastest — fits Vercel Hobby's 60s function limit" },
+  { label: "Standard 25", steps: 25, detail: "Balanced default" },
+  { label: "High 35", steps: 35, detail: "Finer detail, slower — needs Vercel Pro" },
 ] as const;
 
 const ENGINES: Array<{ id: EngineChoice; title: string; detail: string; badge?: string; models: string }> = [
@@ -142,6 +145,9 @@ export function ControlDeck(props: Props) {
     onModeChange,
     prompt,
     onPromptChange,
+    onEnhance,
+    enhancing,
+    enhanceHint,
     engine,
     onEngineChange,
     settings,
@@ -224,11 +230,28 @@ export function ControlDeck(props: Props) {
       {mode === "prompt" ? (
         <>
           <div>
-            <div className="flex items-baseline justify-between">
+            <div className="flex items-center justify-between gap-2">
               <label htmlFor="subject" className="label">
                 Subject
               </label>
-              <span className="mono text-[11px] text-mist-500">{prompt.length}/600</span>
+              <div className="flex items-center gap-2">
+                <span className="mono text-[11px] text-mist-500">{prompt.length}/600</span>
+                <button
+                  type="button"
+                  onClick={onEnhance}
+                  disabled={enhancing || busy || prompt.trim().length < 3}
+                  className="chip"
+                  title="Rewrite the prompt with an NVIDIA LLM (falls back to a local composer)"
+                  style={{ borderColor: "rgba(103,232,249,0.3)", color: "#67e8f9" }}
+                >
+                  {enhancing ? (
+                    <IconSpinner className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <IconSparkles className="h-3 w-3" />
+                  )}
+                  Enhance
+                </button>
+              </div>
             </div>
             <textarea
               id="subject"
@@ -245,6 +268,9 @@ export function ControlDeck(props: Props) {
                 }
               }}
             />
+            {enhanceHint ? (
+              <p className="mt-1.5 text-[10.5px] leading-relaxed text-aqua/80">{enhanceHint}</p>
+            ) : null}
             <div className="mt-2 flex flex-wrap gap-1.5">
               {PRESETS.map((preset) => (
                 <button
@@ -637,7 +663,7 @@ export function ControlDeck(props: Props) {
         {advanced ? (
           <div className="grid gap-3 border-t border-white/[0.06] px-3 py-3">
             <div>
-              <span className="text-[12px] font-medium text-mist-300">Speed preset</span>
+              <span className="text-[12px] font-medium text-mist-300">Quality</span>
               <div className="mt-1.5 grid grid-cols-3 gap-1.5">
                 {STEPS_PRESETS.map((preset) => {
                   const active = settings.slatSteps === preset.steps && settings.ssSteps === preset.steps;
@@ -657,7 +683,7 @@ export function ControlDeck(props: Props) {
                 })}
               </div>
               <p className="mt-1 text-[10px] leading-snug text-mist-500">
-                Vercel stops functions at 60s on Hobby — Fast 15 finishes inside that window far more often.
+                Meshy-style quality tiers. Vercel stops functions at 60 s on Hobby, where Draft 15 is the safe choice.
               </p>
             </div>
             <div className="flex items-end gap-2">

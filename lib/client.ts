@@ -148,6 +148,37 @@ export async function requestMesh(
   return { blob, meta: meta ?? fallbackMeta(blob.size) };
 }
 
+export type EnhanceResponse = {
+  prompt: string;
+  original: string;
+  model: string;
+  elapsedMs: number;
+  offline: boolean;
+  addedShapeWords: boolean;
+  fallbackReason?: string;
+};
+
+/** Meshy-style prompt improvement (LLM NIM, with an offline fallback). */
+export async function requestEnhance(prompt: string, signal?: AbortSignal): Promise<EnhanceResponse> {
+  const response = await fetch("/api/enhance", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt }),
+    signal,
+  });
+  if (!response.ok) {
+    let message = `Prompt enhancement failed (HTTP ${response.status}).`;
+    try {
+      const payload = (await response.json()) as { error?: string };
+      if (payload.error) message = payload.error;
+    } catch {
+      /* keep the generic message */
+    }
+    throw new ApiFailure(message, { status: response.status });
+  }
+  return (await response.json()) as EnhanceResponse;
+}
+
 export function isAbort(error: unknown): boolean {
   return error instanceof DOMException ? error.name === "AbortError" : error instanceof Error && error.name === "AbortError";
 }

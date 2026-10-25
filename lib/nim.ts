@@ -8,6 +8,7 @@
  * All models live behind one key: https://build.nvidia.com
  */
 
+import { conceptSuffix } from "./prompts";
 import {
   DEFAULT_SETTINGS,
   type ConceptResponse,
@@ -18,8 +19,12 @@ import {
 
 export const API_BASE = (process.env.NVIDIA_API_BASE || "https://ai.api.nvidia.com/v1").replace(/\/+$/, "");
 const NVCF_BASE = (process.env.NVIDIA_NVCF_BASE || "https://api.nvcf.nvidia.com/v2/nvcf").replace(/\/+$/, "");
+/** OpenAI-compatible hosted base, used for the prompt-enhancement LLM. */
+const CHAT_BASE = (process.env.NVIDIA_CHAT_BASE || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
 
 export const TRELLIS_MODEL = process.env.NVIDIA_TRELLIS_MODEL || "microsoft/trellis";
+/** Small hosted chat model used to rewrite/expand prompts. */
+export const ENHANCE_MODEL = process.env.NVIDIA_ENHANCE_MODEL || "meta/llama-3.1-8b-instruct";
 
 /**
  * Text-to-image NIMs used for the concept render stage. Both are free to call
@@ -415,14 +420,7 @@ export function normalizeSettings(input?: Partial<GenSettings>): GenSettings {
 
 /** Prompt used for the 2D concept render that TRELLIS lifts into 3D. */
 export function buildConceptPrompt(prompt: string): string {
-  const subject = prompt.trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "");
-  return [
-    subject,
-    "single isolated object, centered, full object visible in frame",
-    "three-quarter front view, slightly above horizon",
-    "plain light neutral studio background, soft even lighting, subtle contact shadow",
-    "clean product render, crisp silhouette, high detail, no text, no watermark, no extra props",
-  ].join(", ");
+  return `${prompt.trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "")}, ${conceptSuffix("three-quarter")}`;
 }
 
 export type MeshInput =
@@ -635,4 +633,60 @@ export async function generateConcept(
     model,
     elapsedMs: Date.now() - started,
   };
+}
+
+/**
+ * Prompt rewriting with a hosted chat NIM (OpenAI-compatible endpoint).
+ * Returns a single-line, model-friendly description of the subject.
+ */
+export async function enhancePrompt(
+  prompt: string,
+  options: { timeoutMs?: number } = {},
+): Promise<{ prompt: string; model: string; elapsedMs: number }> {
+  const started = Date.now();
+  const system = [
+    "You rewrite prompts for a text-to-3D asset generator (Microsoft TRELLIS).",
+    "Given a short description, return ONE line, max 90 words, describing the object itself:",
+    "its form, main parts, materials and colours, as a single isolated object.",
+    "Mention geometry words (hull, saucer, nacelle, pylon, handle, spout, roof, legs) when relevant.",
+    "Never add scenes, background, lighting, camera, mood, brand names, people or text.",
+    "No preamble, no quotes, no lists — output the prompt only.",
+  ].join(" ");
+
+  const { payload } = await callNim(
+    `${CHAT_BASE}/chat/completions`,
+    {
+      model: ENHANCE_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: prompt.slice(0, 600) },
+      ],
+      temperature: 0.7,
+      top_p: 0.9,
+      max_tokens: 220,
+      stream: false,
+    },
+    { timeoutMs: options.timeoutMs ?? 30_000, label: "Prompt enhancer", retries: 1 },
+  );
+
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const message = (choices[0] as Record<string, unknown> | undefined)?.message as Record<string, unknown> | undefined;
+  const content = typeof message?.content === "string" ? message.content : "";
+
+  const cleaned = content
+    .replace(/^```[a-z]*\s*/i, "")
+    .replace(/```$/i, "")
+    .replace(/^["'“”\s]+|["'“”\s]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (cleaned.length < 8) {
+    throw new NimError("The prompt enhancer returned nothing usable.", {
+      status: 502,
+      code: "enhance_empty",
+      hint: "Try again, or use the offline enhancer (it adds shape and material words locally).",
+    });
+  }
+
+  return { prompt: cleaned.slice(0, 600), model: ENHANCE_MODEL, elapsedMs: Date.now() - started };
 }
