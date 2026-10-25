@@ -43,6 +43,9 @@ cp .env.example .env.local        # paste your nvapi-… key
 npm run dev                       # http://localhost:3000
 ```
 
+Until a key is present the UI stays readable and you can still explore the viewport with the bundled
+sample asset (the **Load sample asset** button) — generation simply stays disabled.
+
 Get a free key: <https://build.nvidia.com/settings/api-keys> (Settings → API Keys → Generate API Key).
 A key works across the whole hosted catalog; usage is capped by per-model rate limits instead of credits.
 

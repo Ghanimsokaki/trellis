@@ -118,12 +118,12 @@ export function ViewerStage(props: Props) {
           ) : null}
         </div>
 
-        <div className="glass-soft pointer-events-auto flex items-center gap-1 rounded-xl p-1">
+        <div className="glass-soft pointer-events-auto flex items-center gap-0.5 rounded-xl p-1">
           {DISPLAY_OPTIONS.map((option) => (
             <button
               key={option.id}
               type="button"
-              className="btn-icon border-transparent bg-transparent"
+              className="btn-icon h-8 w-8 border-transparent bg-transparent sm:h-[2.1rem] sm:w-[2.1rem]"
               data-active={display === option.id}
               onClick={() => onDisplayChange(option.id)}
               title={option.label}
@@ -135,7 +135,7 @@ export function ViewerStage(props: Props) {
           <span className="mx-0.5 h-4 w-px bg-white/10" />
           <button
             type="button"
-            className="btn-icon border-transparent bg-transparent"
+            className="btn-icon h-8 w-8 border-transparent bg-transparent sm:h-[2.1rem] sm:w-[2.1rem]"
             data-active={autoRotate}
             onClick={() => onAutoRotateChange(!autoRotate)}
             title="Auto-rotate"
@@ -145,7 +145,7 @@ export function ViewerStage(props: Props) {
           </button>
           <button
             type="button"
-            className="btn-icon border-transparent bg-transparent"
+            className="btn-icon h-8 w-8 border-transparent bg-transparent sm:h-[2.1rem] sm:w-[2.1rem]"
             data-active={showGrid}
             onClick={() => onShowGridChange(!showGrid)}
             title="Ground grid"
