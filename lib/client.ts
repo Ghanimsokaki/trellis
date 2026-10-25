@@ -38,20 +38,54 @@ async function postJson(path: string, body: unknown, signal: AbortSignal): Promi
   }
 
   if (!response.ok) {
+    const contentType = response.headers.get("content-type") ?? "";
     let payload: Record<string, unknown> = {};
+    let text = "";
     try {
-      payload = (await response.json()) as Record<string, unknown>;
+      if (contentType.includes("application/json")) {
+        payload = (await response.json()) as Record<string, unknown>;
+      } else {
+        text = await response.text();
+      }
     } catch {
       payload = {};
     }
-    const message =
-      typeof payload.error === "string" && payload.error
-        ? payload.error
-        : `Request failed with HTTP ${response.status}.`;
-    throw new ApiFailure(message, {
-      hint: typeof payload.hint === "string" ? payload.hint : null,
-      detail: typeof payload.detail === "string" ? payload.detail : null,
-      requestId: typeof payload.requestId === "string" ? payload.requestId : null,
+
+    if (typeof payload.error === "string" && payload.error) {
+      throw new ApiFailure(payload.error, {
+        hint: typeof payload.hint === "string" ? payload.hint : null,
+        detail: typeof payload.detail === "string" ? payload.detail : null,
+        requestId: typeof payload.requestId === "string" ? payload.requestId : null,
+        status: response.status,
+      });
+    }
+
+    // The platform (not our route) answered — a killed function returns HTML.
+    if (response.status === 504) {
+      throw new ApiFailure("The 3D job ran past the function time limit.", {
+        hint:
+          "Vercel stops functions at 60s on Hobby and 300s on Pro. The studio will retry in Fast mode (15 steps) automatically — you can also lower the steps yourself.",
+        detail: text.slice(0, 300) || null,
+        status: 504,
+      });
+    }
+    if (response.status === 413) {
+      throw new ApiFailure("The upload was too large for the serverless function.", {
+        hint: "Keep a single 1024² view under ~3 MB. The studio already downscales — try one view instead of several.",
+        detail: text.slice(0, 300) || null,
+        status: 413,
+      });
+    }
+    if (response.status === 502 || response.status === 503) {
+      throw new ApiFailure("The server could not reach NVIDIA NIM.", {
+        hint: "NVIDIA's hosted TRELLIS function occasionally errors out. Retry in a moment, or use the other engine.",
+        detail: text.slice(0, 300) || null,
+        status: response.status,
+      });
+    }
+
+    throw new ApiFailure(`Request failed with HTTP ${response.status}.`, {
+      detail: text.slice(0, 300) || null,
       status: response.status,
     });
   }
@@ -99,6 +133,7 @@ export async function requestMesh(
     mode: "text" | "image";
     prompt?: string;
     image?: string;
+    images?: string[];
     engine: "pipeline" | "trellis-text" | "image";
     imageModel?: string | null;
     conceptPrompt?: string | null;

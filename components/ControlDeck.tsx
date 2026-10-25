@@ -41,6 +41,12 @@ type Props = {
   onPickFile: (file: File) => void;
   onClearImage: () => void;
   imageError: string | null;
+  matte: boolean;
+  onMatteChange: (value: boolean) => void;
+  preparing: boolean;
+  extraViews: PreparedImage[];
+  onAddView: (file: File) => void;
+  onRemoveView: (index: number) => void;
   busy: boolean;
   stages: PipelineStage[];
   elapsedMs: number;
@@ -53,6 +59,12 @@ type Props = {
   imageModels: string[];
   onImageModelChange: (id: string) => void;
 };
+
+const STEPS_PRESETS = [
+  { label: "Fast 15", steps: 15, detail: "Fits Vercel Hobby's 60s function limit" },
+  { label: "Balanced 25", steps: 25, detail: "Default quality" },
+  { label: "Deep 35", steps: 35, detail: "Slower, finer detail — needs Vercel Pro" },
+] as const;
 
 const ENGINES: Array<{ id: EngineChoice; title: string; detail: string; badge?: string; models: string }> = [
   {
@@ -130,6 +142,12 @@ export function ControlDeck(props: Props) {
     onPickFile,
     onClearImage,
     imageError,
+    matte,
+    onMatteChange,
+    preparing,
+    extraViews,
+    onAddView,
+    onRemoveView,
     busy,
     stages,
     elapsedMs,
@@ -144,6 +162,7 @@ export function ControlDeck(props: Props) {
   } = props;
 
   const fileInput = useRef<HTMLInputElement | null>(null);
+  const viewInput = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
   const [advanced, setAdvanced] = useState(false);
 
@@ -287,11 +306,25 @@ export function ControlDeck(props: Props) {
               event.target.value = "";
             }}
           />
+          <input
+            ref={viewInput}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            className="hidden"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) onAddView(file);
+              event.target.value = "";
+            }}
+          />
           {image ? (
             <div className="mt-2 overflow-hidden rounded-xl border border-white/[0.08] bg-ink-950/60">
-              <div className="relative aspect-[4/3] w-full">
+              <div className="relative aspect-square w-full">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={image.dataUrl} alt={image.name} className="h-full w-full object-contain" />
+                <img src={image.dataUrl} alt="Prepared reference" className="h-full w-full object-contain" />
+                <span className="absolute left-2 top-2 rounded-full border border-lime-glow/30 bg-ink-950/80 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-lime-glow">
+                  what TRELLIS sees
+                </span>
                 <button
                   type="button"
                   onClick={onClearImage}
@@ -300,13 +333,52 @@ export function ControlDeck(props: Props) {
                 >
                   <IconTrash className="h-3.5 w-3.5" />
                 </button>
+                {preparing ? (
+                  <span className="absolute inset-0 grid place-items-center bg-ink-950/70">
+                    <IconSpinner className="h-5 w-5 animate-spin text-lime-glow" />
+                  </span>
+                ) : null}
               </div>
+
               <div className="flex items-center justify-between gap-2 border-t border-white/[0.06] px-3 py-2">
                 <span className="truncate text-[11.5px] text-mist-300">{image.name}</span>
                 <span className="mono shrink-0 text-[10.5px] text-mist-500">
                   {image.width}×{image.height}
                 </span>
               </div>
+
+              <label className="flex cursor-pointer items-start gap-2 border-t border-white/[0.06] px-3 py-2.5">
+                <input
+                  type="checkbox"
+                  checked={matte}
+                  onChange={(event) => onMatteChange(event.target.checked)}
+                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-lime-glow"
+                />
+                <span className="min-w-0">
+                  <span className="block text-[11.5px] font-medium text-mist-100">
+                    Cut the background out
+                  </span>
+                  <span className="mono block truncate text-[10px] text-mist-500">
+                    {image.matte
+                      ? `matte on · ${image.matte.removed} island${image.matte.removed === 1 ? "" : "s"} removed · object ${(image.matte.coverage * 100).toFixed(0)}% of frame`
+                      : "matte off · original background kept"}
+                  </span>
+                </span>
+              </label>
+
+              {image.originalDataUrl ? (
+                <div className="flex items-center gap-2 border-t border-white/[0.06] px-3 py-2">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={image.originalDataUrl}
+                    alt="Original upload"
+                    className="h-9 w-14 shrink-0 rounded border border-white/10 object-cover opacity-80"
+                  />
+                  <span className="mono text-[9.5px] leading-tight text-mist-500">
+                    original upload · kept local only
+                  </span>
+                </div>
+              ) : null}
             </div>
           ) : (
             <button
@@ -334,10 +406,48 @@ export function ControlDeck(props: Props) {
               </span>
               <span className="text-[13px] font-medium text-mist-100">Drop an image, or click to browse</span>
               <span className="max-w-[15rem] text-[11px] leading-relaxed text-mist-500">
-                One object, plain background, three-quarter view. PNG · JPG · WEBP, upscaled to 1024px.
+                One object, plain background, three-quarter view. PNG · JPG · WEBP — auto-fitted to 1024².
               </span>
             </button>
           )}
+          {image ? (
+            <div className="mt-2">
+              <div className="flex items-center justify-between">
+                <span className="label">Extra views · optional</span>
+                <span className="mono text-[10px] text-mist-500">{extraViews.length + 1}/3</span>
+              </div>
+              <div className="mt-1.5 flex items-center gap-2">
+                {extraViews.map((view, index) => (
+                  <div key={`${view.name}-${index}`} className="relative h-12 w-12 overflow-hidden rounded-lg border border-white/10">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={view.dataUrl} alt={view.name} className="h-full w-full object-cover" />
+                    <button
+                      type="button"
+                      onClick={() => onRemoveView(index)}
+                      className="absolute right-0 top-0 grid h-4 w-4 place-items-center rounded-bl bg-ink-950/85 text-mist-300 hover:text-rose-200"
+                      aria-label="Remove view"
+                    >
+                      <IconX className="h-2.5 w-2.5" />
+                    </button>
+                  </div>
+                ))}
+                {extraViews.length < 2 ? (
+                  <button
+                    type="button"
+                    onClick={() => viewInput.current?.click()}
+                    className="grid h-12 w-12 place-items-center rounded-lg border border-dashed border-white/20 text-mist-300 transition hover:border-lime-glow/60 hover:text-lime-glow"
+                    title="Add another view (front / top / side)"
+                  >
+                    <span className="text-lg leading-none">+</span>
+                  </button>
+                ) : null}
+                <p className="ml-1 max-w-[10rem] text-[10px] leading-snug text-mist-500">
+                  TRELLIS averages up to 8 views — front + top + side fixes nacelle spacing on ships.
+                </p>
+              </div>
+            </div>
+          ) : null}
+
           <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-relaxed text-mist-500">
             <span className="mt-[3px] h-1 w-1 shrink-0 rounded-full bg-aqua/70" />
             You can also paste an image from your clipboard anywhere in the studio.
@@ -368,6 +478,30 @@ export function ControlDeck(props: Props) {
         </button>
         {advanced ? (
           <div className="grid gap-3 border-t border-white/[0.06] px-3 py-3">
+            <div>
+              <span className="text-[12px] font-medium text-mist-300">Speed preset</span>
+              <div className="mt-1.5 grid grid-cols-3 gap-1.5">
+                {STEPS_PRESETS.map((preset) => {
+                  const active = settings.slatSteps === preset.steps && settings.ssSteps === preset.steps;
+                  return (
+                    <button
+                      key={preset.label}
+                      type="button"
+                      onClick={() => onSettingsChange({ slatSteps: preset.steps, ssSteps: preset.steps })}
+                      className="chip justify-center"
+                      data-active={active}
+                      title={preset.detail}
+                      style={active ? { borderColor: "rgba(154,230,0,0.5)", color: "#c6ff45", background: "rgba(154,230,0,0.08)" } : undefined}
+                    >
+                      {preset.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-1 text-[10px] leading-snug text-mist-500">
+                Vercel stops functions at 60s on Hobby — Fast 15 finishes inside that window far more often.
+              </p>
+            </div>
             <div className="flex items-end gap-2">
               <label className="flex-1">
                 <span className="text-[12px] font-medium text-mist-300">Seed</span>
@@ -537,6 +671,11 @@ export function ControlDeck(props: Props) {
               <p className="text-[12.5px] font-semibold text-rose-100">{error.message}</p>
               {error.hint ? (
                 <p className="mt-1 text-[11.5px] leading-relaxed text-rose-200/80">{error.hint}</p>
+              ) : null}
+              {error.detail ? (
+                <pre className="mono mt-2 max-h-28 overflow-auto whitespace-pre-wrap break-words rounded-md border border-rose-300/20 bg-black/40 p-2 text-[10px] leading-relaxed text-rose-200/75">
+                  {error.detail}
+                </pre>
               ) : null}
               {error.requestId ? (
                 <p className="mono mt-1.5 truncate text-[10px] text-rose-200/50">nvcf-reqid {error.requestId}</p>

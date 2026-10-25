@@ -1,4 +1,4 @@
-import { API_BASE, DEFAULT_IMAGE_MODEL, IMAGE_MODELS, TRELLIS_MODEL, resolveKey } from "@/lib/nim";
+import { API_BASE, DEFAULT_IMAGE_MODEL, IMAGE_MODELS, TRELLIS_MODEL, isSelfHosted, resolveKey } from "@/lib/nim";
 import type { HealthResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -6,8 +6,11 @@ export const dynamic = "force-dynamic";
 
 export function GET() {
   const { variable } = resolveKey();
+  const selfHosted = isSelfHosted();
   const body: HealthResponse = {
-    configured: variable !== null,
+    configured: variable !== null || selfHosted,
+    hasKey: variable !== null,
+    selfHosted,
     authVariable: variable,
     trellisModel: TRELLIS_MODEL,
     imageModel: DEFAULT_IMAGE_MODEL,

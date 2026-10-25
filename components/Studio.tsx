@@ -71,6 +71,11 @@ export function Studio({ initialHealth }: Props) {
   const [imageModel, setImageModel] = useState(initialHealth.imageModel);
 
   const [image, setImage] = useState<PreparedImage | null>(null);
+  const [rawFile, setRawFile] = useState<File | null>(null);
+  const [extraFiles, setExtraFiles] = useState<File[]>([]);
+  const [extraViews, setExtraViews] = useState<PreparedImage[]>([]);
+  const [matte, setMatte] = useState(true);
+  const [preparing, setPreparing] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
 
   const [busy, setBusy] = useState(false);
@@ -93,6 +98,7 @@ export function Studio({ initialHealth }: Props) {
   const [toast, setToast] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const inFlightRef = useRef(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const toastRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const historyRef = useRef<Asset[]>([]);
@@ -149,23 +155,70 @@ export function Studio({ initialHealth }: Props) {
     return nextAsset;
   }, []);
 
+  const prepare = useCallback(async (file: File, useMatte: boolean) => {
+    setPreparing(true);
+    setImageError(null);
+    try {
+      const prepared = await prepareImageFile(file, { matte: useMatte });
+      setImage(prepared);
+      return prepared;
+    } catch (fileError) {
+      setImageError(fileError instanceof Error ? fileError.message : "Could not read that image.");
+      return null;
+    } finally {
+      setPreparing(false);
+    }
+  }, []);
+
   const handleFile = useCallback(
     async (file: File) => {
-      setImageError(null);
-      try {
-        const prepared = await prepareImageFile(file);
-        setImage(prepared);
-        setMode("image");
-        setError(null);
-      } catch (fileError) {
-        setImageError(fileError instanceof Error ? fileError.message : "Could not read that image.");
+      setMode("image");
+      setError(null);
+      setRawFile(file);
+      const prepared = await prepare(file, matte);
+      if (prepared && !prepared.matte && matte) {
+        setImageError("Could not separate a clean object — the background is not uniform. Upload a single object on a plain background.");
       }
     },
-    [],
+    [matte, prepare],
   );
 
-  const run = useCallback(async (overrides?: Partial<GenSettings>) => {
-    if (busy) return;
+  const handleAddView = useCallback(
+    async (file: File) => {
+      if (extraFiles.length >= 2) return;
+      setImageError(null);
+      try {
+        const prepared = await prepareImageFile(file, { matte });
+        setExtraFiles((previous) => [...previous, file].slice(0, 2));
+        setExtraViews((previous) => [...previous, prepared].slice(0, 2));
+      } catch (viewError) {
+        setImageError(viewError instanceof Error ? viewError.message : "Could not read that view.");
+      }
+    },
+    [extraFiles.length, matte],
+  );
+
+  const handleRemoveView = useCallback((index: number) => {
+    setExtraFiles((previous) => previous.filter((_, position) => position !== index));
+    setExtraViews((previous) => previous.filter((_, position) => position !== index));
+  }, []);
+
+  const handleMatteChange = useCallback(
+    (value: boolean) => {
+      setMatte(value);
+      setImageError(null);
+      if (rawFile) void prepare(rawFile, value);
+      if (extraFiles.length > 0) {
+        void Promise.all(extraFiles.map((file) => prepareImageFile(file, { matte: value })))
+          .then((prepared) => setExtraViews(prepared.filter((entry): entry is PreparedImage => entry !== null)))
+          .catch(() => undefined);
+      }
+    },
+    [extraFiles, prepare, rawFile],
+  );
+
+  const run = useCallback(async (overrides?: Partial<GenSettings>, attempt = 0) => {
+    if (inFlightRef.current) return;
     const activeSettings: GenSettings = { ...settings, ...(overrides ?? {}) };
     if (!health.configured) {
       setError({
@@ -175,6 +228,13 @@ export function Studio({ initialHealth }: Props) {
       return;
     }
     const trimmed = prompt.trim();
+    if (mode === "prompt" && engine === "pipeline" && !health.hasKey) {
+      setError({
+        message: "The concept render needs a hosted NVIDIA key.",
+        hint: "NVIDIA_API_KEY is missing, so FLUX can't paint the reference. Add the key, or switch the engine to Direct text → 3D (that path can run against your self-hosted TRELLIS).",
+      });
+      return;
+    }
     if (mode === "prompt" && trimmed.length < 3) {
       setError({ message: "Describe what to build first.", hint: "Try one of the example chips above." });
       return;
@@ -187,6 +247,7 @@ export function Studio({ initialHealth }: Props) {
     const plan = buildPlan(mode, engine, imageModel);
     const controller = new AbortController();
     abortRef.current = controller;
+    inFlightRef.current = true;
 
     setError(null);
     setViewerError(null);
@@ -217,6 +278,10 @@ export function Studio({ initialHealth }: Props) {
           : ({
               mode: "image",
               image: imageData!,
+              images:
+                mode === "image" && extraViews.length > 0
+                  ? [imageData!, ...extraViews.map((view) => view.dataUrl)]
+                  : undefined,
               prompt: mode === "prompt" ? trimmed : undefined,
               engine: mode === "image" ? "image" : "pipeline",
               imageModel: conceptResult?.model ?? null,
@@ -226,6 +291,7 @@ export function Studio({ initialHealth }: Props) {
 
       const result = await requestMesh(payload, controller.signal);
       setStages(toStages(plan, plan.length - 1));
+      setSettings((previous) => ({ ...previous, ...activeSettings }));
       commitAsset(result.blob, result.meta, conceptResult?.image ?? imageData);
       setElapsedMs(Date.now() - startedAt);
       notify("Mesh ready — orbit it or download the GLB");
@@ -233,6 +299,14 @@ export function Studio({ initialHealth }: Props) {
       if (isAbort(runError)) {
         setStages((previous) => previous.map((stage) => (stage.state === "active" ? { ...stage, state: "idle" } : stage)));
         notify("Generation cancelled");
+      } else if (runError instanceof ApiFailure && runError.status === 504 && attempt === 0 && activeSettings.slatSteps > 15) {
+        // Vercel killed the function: retry once at 15 steps, which usually fits.
+        notify("Timed out — retrying in Fast mode (15 steps)…");
+        setStages([]);
+        setTimeout(() => {
+          void runRef.current({ slatSteps: 15, ssSteps: 15 }, 1);
+        }, 80);
+        return;
       } else {
         const generationError: GenerationError =
           runError instanceof ApiFailure
@@ -250,9 +324,10 @@ export function Studio({ initialHealth }: Props) {
       if (timerRef.current) clearInterval(timerRef.current);
       timerRef.current = null;
       abortRef.current = null;
+      inFlightRef.current = false;
       setBusy(false);
     }
-  }, [busy, commitAsset, engine, health.configured, image, imageModel, mode, notify, prompt, settings]);
+  }, [busy, commitAsset, engine, health.configured, health.hasKey, image, imageModel, mode, notify, prompt, settings]);
 
   const runRef = useRef(run);
   runRef.current = run;
@@ -445,8 +520,17 @@ export function Studio({ initialHealth }: Props) {
             onClearImage={() => {
               setImage(null);
               setImageError(null);
+              setRawFile(null);
+              setExtraFiles([]);
+              setExtraViews([]);
             }}
             imageError={imageError}
+            matte={matte}
+            onMatteChange={handleMatteChange}
+            preparing={preparing}
+            extraViews={extraViews}
+            onAddView={(file) => void handleAddView(file)}
+            onRemoveView={handleRemoveView}
             busy={busy}
             stages={stages}
             elapsedMs={elapsedMs}
@@ -592,7 +676,11 @@ function SiteHeader({ health }: { health: HealthResponse }) {
             title={health.configured ? "The server can sign NIM requests" : "Add NVIDIA_API_KEY to enable generation"}
           >
             <span className={`h-1.5 w-1.5 rounded-full ${health.configured ? "bg-lime-glow" : "bg-amber-300"}`} />
-            {health.configured ? `${health.authVariable ?? "NVIDIA_API_KEY"} linked` : "key missing"}
+            {health.configured
+              ? health.selfHosted && !health.hasKey
+                ? "self-hosted NIM"
+                : `${health.authVariable ?? "NVIDIA_API_KEY"} linked`
+              : "key missing"}
           </span>
           <a
             className="btn-ghost hidden sm:inline-flex"
