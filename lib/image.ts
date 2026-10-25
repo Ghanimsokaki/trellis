@@ -4,15 +4,104 @@
  * Browser-side image preparation for TRELLIS.
  *
  * TRELLIS expects "around 1 MP" with a single centred object on a plain
- * background. Real uploads are 597×335 screenshots of a starship with a planet
- * in frame, so we:
+ * background — but a real upload is often a 597×335 screenshot of a starship
+ * with a planet, starfield and warp glows in frame. So before a single API
+ * call we:
  *   1. fit the upload into a ~1 MP working canvas (upscaling is fine),
  *   2. optionally matte the background out (border flood-fill + keep the
  *      object's connected components, which also drops stars/specks),
- *   3. re-frame the object to fill a square 1024² canvas on light grey.
+ *   3. run the user's filter stack (auto-levels, exposure, contrast,
+ *      saturation, unsharp mask, plate colour),
+ *   4. re-frame the object to fill a square 1024² canvas.
  *
- * The result is exactly what the API receives, and it is shown to the user.
+ * The result is exactly what the API receives, and the panel shows it.
  */
+
+export type PlateColor = "paper" | "white" | "grey" | "dark";
+
+export type FilterSettings = {
+  /** keep only the centred object, drop background/scenery */
+  matte: boolean;
+  /** backdrop colour behind the object */
+  plate: PlateColor;
+  /** percentile stretch — rescues dark space screenshots */
+  autoLevels: boolean;
+  /** -50 … 50 */
+  brightness: number;
+  /** -50 … 50 */
+  contrast: number;
+  /** -50 … 50 (negative desaturates) */
+  saturation: number;
+  /** 0 … 100 unsharp mask */
+  sharpen: number;
+};
+
+export const PLATE_COLORS: Record<PlateColor, string> = {
+  paper: "#f1f2f4",
+  white: "#ffffff",
+  grey: "#b9bec7",
+  dark: "#1b1f26",
+};
+
+export const DEFAULT_FILTERS: FilterSettings = {
+  matte: true,
+  plate: "paper",
+  autoLevels: true,
+  brightness: 6,
+  contrast: 12,
+  saturation: 0,
+  sharpen: 35,
+};
+
+export const RAW_FILTERS: FilterSettings = {
+  matte: false,
+  plate: "paper",
+  autoLevels: false,
+  brightness: 0,
+  contrast: 0,
+  saturation: 0,
+  sharpen: 0,
+};
+
+export type FilterPreset = {
+  id: string;
+  label: string;
+  detail: string;
+  filters: FilterSettings;
+};
+
+export const FILTER_PRESETS: FilterPreset[] = [
+  {
+    id: "studio",
+    label: "Studio",
+    detail: "Cut out the object, brighten, sharpen — best default for spaceship renders",
+    filters: DEFAULT_FILTERS,
+  },
+  {
+    id: "clean",
+    label: "Clean cut",
+    detail: "Object on flat paper, no tone changes",
+    filters: { ...DEFAULT_FILTERS, autoLevels: false, brightness: 0, contrast: 0, sharpen: 0 },
+  },
+  {
+    id: "rescue",
+    label: "Rescue dark",
+    detail: "Hard level stretch for very dark screenshots",
+    filters: { ...DEFAULT_FILTERS, contrast: 26, brightness: 16, sharpen: 55 },
+  },
+  {
+    id: "silhouette",
+    label: "Silhouette",
+    detail: "High contrast on white — helps thin pylons read",
+    filters: { ...DEFAULT_FILTERS, plate: "white", contrast: 34, brightness: 20, saturation: -30, sharpen: 70 },
+  },
+  {
+    id: "raw",
+    label: "Raw",
+    detail: "Exactly the uploaded frame, untouched",
+    filters: RAW_FILTERS,
+  },
+];
 
 export type MatteInfo = {
   applied: boolean;
@@ -32,12 +121,15 @@ export type PreparedImage = {
   height: number;
   bytes: number;
   matte: MatteInfo | null;
+  filters: FilterSettings;
 };
 
-export type PrepareOptions = { matte?: boolean; size?: number };
+export type PrepareOptions = {
+  filters?: Partial<FilterSettings>;
+  size?: number;
+};
 
 const MAX_UPLOAD_BYTES = 24 * 1024 * 1024;
-const PAPER = "#f1f2f4";
 /** max RGB euclidean distance from the sampled background colour */
 const BG_TOLERANCE = 46;
 /** components smaller than this share of the frame are noise */
@@ -292,6 +384,147 @@ export function buildForegroundMask(
   };
 }
 
+/* ------------------------------------------------------------------------- *
+ * Filter maths — pure functions over RGBA pixel buffers, so they can be
+ * unit-tested without a DOM. Pixels with alpha 0 are never touched.
+ * ------------------------------------------------------------------------- */
+
+type Pixels = Uint8ClampedArray;
+
+function clampChannel(value: number): number {
+  return value < 0 ? 0 : value > 255 ? 255 : value;
+}
+
+const luma = (r: number, g: number, b: number) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+
+/** 2 % / 98 % luminance percentiles of the visible pixels. */
+export function luminancePercentiles(pixels: Pixels, lowPercent = 0.02, highPercent = 0.98): { low: number; high: number } {
+  const histogram = new Uint32Array(256);
+  let visible = 0;
+  for (let index = 0; index < pixels.length; index += 4) {
+    if (pixels[index + 3] === 0) continue;
+    histogram[Math.round(luma(pixels[index], pixels[index + 1], pixels[index + 2]))] += 1;
+    visible += 1;
+  }
+  if (visible === 0) return { low: 0, high: 255 };
+
+  const targetLow = visible * lowPercent;
+  const targetHigh = visible * highPercent;
+  let low = 0;
+  let high = 255;
+  let cumulative = 0;
+  for (let value = 0; value < 256; value += 1) {
+    cumulative += histogram[value];
+    if (cumulative >= targetLow) {
+      low = value;
+      break;
+    }
+  }
+  cumulative = 0;
+  for (let value = 255; value >= 0; value -= 1) {
+    cumulative += histogram[value];
+    if (cumulative >= visible - targetHigh) {
+      high = value;
+      break;
+    }
+  }
+  if (high - low < 12) {
+    // Almost flat image: don't amplify noise.
+    return { low: 0, high: 255 };
+  }
+  return { low, high };
+}
+
+/** Percentile stretch, applied to the visible pixels only. */
+export function applyAutoLevels(pixels: Pixels): void {
+  const { low, high } = luminancePercentiles(pixels);
+  if (low <= 0 && high >= 255) return;
+  const span = Math.max(1, high - low);
+  const scale = 255 / span;
+  for (let index = 0; index < pixels.length; index += 4) {
+    if (pixels[index + 3] === 0) continue;
+    pixels[index] = clampChannel((pixels[index] - low) * scale);
+    pixels[index + 1] = clampChannel((pixels[index + 1] - low) * scale);
+    pixels[index + 2] = clampChannel((pixels[index + 2] - low) * scale);
+  }
+}
+
+export function applyTone(
+  pixels: Pixels,
+  options: { brightness?: number; contrast?: number; saturation?: number },
+): void {
+  const brightness = (options.brightness ?? 0) * 2.55;
+  const contrast = options.contrast ?? 0;
+  const contrastFactor = (100 + contrast) / 100;
+  const saturation = options.saturation ?? 0;
+  const saturationFactor = 1 + saturation / 100;
+
+  if (brightness === 0 && contrastFactor === 1 && saturationFactor === 1) return;
+
+  for (let index = 0; index < pixels.length; index += 4) {
+    if (pixels[index + 3] === 0) continue;
+    let r = pixels[index] + brightness;
+    let g = pixels[index + 1] + brightness;
+    let b = pixels[index + 2] + brightness;
+
+    if (contrastFactor !== 1) {
+      r = (r - 128) * contrastFactor + 128;
+      g = (g - 128) * contrastFactor + 128;
+      b = (b - 128) * contrastFactor + 128;
+    }
+
+    if (saturationFactor !== 1) {
+      const grey = luma(r, g, b);
+      r = grey + (r - grey) * saturationFactor;
+      g = grey + (g - grey) * saturationFactor;
+      b = grey + (b - grey) * saturationFactor;
+    }
+
+    pixels[index] = clampChannel(r);
+    pixels[index + 1] = clampChannel(g);
+    pixels[index + 2] = clampChannel(b);
+  }
+}
+
+/** 3×3 unsharp mask; `amount` is 0…100. */
+export function applySharpen(pixels: Pixels, width: number, height: number, amount: number): void {
+  if (amount <= 0 || width < 3 || height < 3) return;
+  const strength = (amount / 100) * 1.6;
+  const source = new Uint8ClampedArray(pixels);
+
+  const at = (x: number, y: number, channel: number) =>
+    source[((y * width + x) << 2) + channel];
+
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const index = (y * width + x) << 2;
+      if (source[index + 3] === 0) continue;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const centre = source[index + channel];
+        const neighbours =
+          at(x - 1, y - 1, channel) + at(x, y - 1, channel) + at(x + 1, y - 1, channel) +
+          at(x - 1, y, channel) + at(x + 1, y, channel) +
+          at(x - 1, y + 1, channel) + at(x, y + 1, channel) + at(x + 1, y + 1, channel);
+        const blurred = neighbours / 8;
+        pixels[index + channel] = clampChannel(centre + (centre - blurred) * strength);
+      }
+    }
+  }
+}
+
+/** Run the whole stack over one image buffer, in a stable order. */
+export function applyFilterStack(
+  pixels: Pixels,
+  width: number,
+  height: number,
+  filters: Pick<FilterSettings, "autoLevels" | "brightness" | "contrast" | "saturation" | "sharpen">,
+): void {
+  if (filters.autoLevels) applyAutoLevels(pixels);
+  applyTone(pixels, { brightness: filters.brightness, contrast: filters.contrast, saturation: filters.saturation });
+  applySharpen(pixels, width, height, filters.sharpen);
+}
+
+
 function matteCanvas(source: HTMLCanvasElement): { canvas: HTMLCanvasElement; box: MaskResult["box"]; removed: number; coverage: number } | null {
   const ctx = source.getContext("2d", { willReadFrequently: true });
   if (!ctx) return null;
@@ -325,6 +558,15 @@ function matteCanvas(source: HTMLCanvasElement): { canvas: HTMLCanvasElement; bo
   return { canvas: cutout, box: result.box, removed: result.removed, coverage: result.coverage };
 }
 
+/** Apply the filter stack in place on a canvas (alpha 0 pixels are skipped). */
+function filterCanvas(canvas: HTMLCanvasElement, filters: FilterSettings): void {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return;
+  const image = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  applyFilterStack(image.data, canvas.width, canvas.height, filters);
+  ctx.putImageData(image, 0, 0);
+}
+
 export async function prepareImageFile(file: File, options: PrepareOptions = {}): Promise<PreparedImage> {
   if (!file.type.startsWith("image/")) {
     throw new Error("That file is not an image. Use PNG, JPG or WEBP.");
@@ -334,7 +576,8 @@ export async function prepareImageFile(file: File, options: PrepareOptions = {})
   }
 
   const target = Math.min(Math.max(Math.round(options.size ?? 1024), 512), 1536);
-  const useMatte = options.matte ?? true;
+  const filters: FilterSettings = { ...DEFAULT_FILTERS, ...(options.filters ?? {}) };
+  const plate = PLATE_COLORS[filters.plate] ?? PLATE_COLORS.paper;
 
   const bitmap = await loadBitmap(file);
   const originalDataUrl = await renderPreview(bitmap, 480);
@@ -349,7 +592,7 @@ export async function prepareImageFile(file: File, options: PrepareOptions = {})
   const work = makeCanvas(workWidth, workHeight);
   const workCtx = work.getContext("2d", { willReadFrequently: true });
   if (!workCtx) throw new Error("This browser cannot process images.");
-  workCtx.fillStyle = PAPER;
+  workCtx.fillStyle = plate;
   workCtx.fillRect(0, 0, workWidth, workHeight);
   workCtx.imageSmoothingQuality = "high";
   workCtx.drawImage(bitmap as CanvasImageSource, 0, 0, workWidth, workHeight);
@@ -358,15 +601,18 @@ export async function prepareImageFile(file: File, options: PrepareOptions = {})
   const output = makeCanvas(target, target);
   const outputCtx = output.getContext("2d");
   if (!outputCtx) throw new Error("This browser cannot process images.");
-  outputCtx.fillStyle = PAPER;
+  outputCtx.fillStyle = plate;
   outputCtx.fillRect(0, 0, target, target);
   outputCtx.imageSmoothingQuality = "high";
 
   let matte: MatteInfo | null = null;
 
-  if (useMatte) {
+  if (filters.matte) {
     const result = matteCanvas(work);
     if (result) {
+      // Tone-map the cut-out (background pixels are transparent, so untouched)
+      // before it is scaled into the square.
+      filterCanvas(result.canvas, filters);
       const { box } = result;
       const fit = Math.round(target * 0.86);
       const ratio = Math.min(fit / box.width, fit / box.height);
@@ -380,6 +626,8 @@ export async function prepareImageFile(file: File, options: PrepareOptions = {})
   }
 
   if (!matte) {
+    // No usable cut-out (or matte disabled): tone-map the whole frame.
+    filterCanvas(work, filters);
     const dx = Math.round((target - workWidth) / 2);
     const dy = Math.round((target - workHeight) / 2);
     outputCtx.drawImage(work, dx, dy);
@@ -395,5 +643,6 @@ export async function prepareImageFile(file: File, options: PrepareOptions = {})
     height: target,
     bytes: estimateDataUrlBytes(dataUrl),
     matte,
+    filters,
   };
 }

@@ -15,7 +15,14 @@ import {
   IconX,
 } from "@/components/Icons";
 import { PRESETS } from "@/lib/presets";
-import type { PreparedImage } from "@/lib/image";
+import {
+  FILTER_PRESETS,
+  PLATE_COLORS,
+  RAW_FILTERS,
+  type FilterSettings,
+  type PlateColor,
+  type PreparedImage,
+} from "@/lib/image";
 import { DEFAULT_SETTINGS, formatMs, randomSeed, type GenSettings, type PipelineStage } from "@/lib/types";
 
 export type EngineChoice = "pipeline" | "trellis-text";
@@ -41,8 +48,9 @@ type Props = {
   onPickFile: (file: File) => void;
   onClearImage: () => void;
   imageError: string | null;
-  matte: boolean;
-  onMatteChange: (value: boolean) => void;
+  filters: FilterSettings;
+  onFiltersChange: (patch: Partial<FilterSettings>) => void;
+  onPreset: (filters: FilterSettings) => void;
   preparing: boolean;
   extraViews: PreparedImage[];
   onAddView: (file: File) => void;
@@ -142,8 +150,9 @@ export function ControlDeck(props: Props) {
     onPickFile,
     onClearImage,
     imageError,
-    matte,
-    onMatteChange,
+    filters,
+    onFiltersChange,
+    onPreset,
     preparing,
     extraViews,
     onAddView,
@@ -165,6 +174,8 @@ export function ControlDeck(props: Props) {
   const viewInput = useRef<HTMLInputElement | null>(null);
   const [dragging, setDragging] = useState(false);
   const [advanced, setAdvanced] = useState(false);
+  const [tuning, setTuning] = useState(false);
+  const [activePresetId, setActivePresetId] = useState<string>(() => matchingPresetId(filters));
 
   const showStages = stages.some((stage) => stage.state !== "idle");
   const canRun =
@@ -334,8 +345,9 @@ export function ControlDeck(props: Props) {
                   <IconTrash className="h-3.5 w-3.5" />
                 </button>
                 {preparing ? (
-                  <span className="absolute inset-0 grid place-items-center bg-ink-950/70">
-                    <IconSpinner className="h-5 w-5 animate-spin text-lime-glow" />
+                  <span className="absolute bottom-2 left-2 flex items-center gap-1.5 rounded-full border border-lime-glow/30 bg-ink-950/85 px-2 py-1">
+                    <IconSpinner className="h-3 w-3 animate-spin text-lime-glow" />
+                    <span className="mono text-[9px] uppercase tracking-wider text-lime-glow">filtering</span>
                   </span>
                 ) : null}
               </div>
@@ -347,24 +359,169 @@ export function ControlDeck(props: Props) {
                 </span>
               </div>
 
-              <label className="flex cursor-pointer items-start gap-2 border-t border-white/[0.06] px-3 py-2.5">
-                <input
-                  type="checkbox"
-                  checked={matte}
-                  onChange={(event) => onMatteChange(event.target.checked)}
-                  className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-lime-glow"
-                />
-                <span className="min-w-0">
-                  <span className="block text-[11.5px] font-medium text-mist-100">
-                    Cut the background out
+              <div className="border-t border-white/[0.06] px-3 py-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="label">Filters</span>
+                  <span className="mono text-[9.5px] uppercase tracking-wider text-mist-500">
+                    {filters.matte ? "cut-out · paper bg" : "full frame"}
                   </span>
-                  <span className="mono block truncate text-[10px] text-mist-500">
-                    {image.matte
-                      ? `matte on · ${image.matte.removed} island${image.matte.removed === 1 ? "" : "s"} removed · object ${(image.matte.coverage * 100).toFixed(0)}% of frame`
-                      : "matte off · original background kept"}
+                </div>
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {FILTER_PRESETS.map((preset) => {
+                    const active = preset.id === activePresetId;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className="chip"
+                        data-active={active}
+                        title={preset.detail}
+                        onClick={() => {
+                          setActivePresetId(preset.id);
+                          onPreset(preset.filters);
+                        }}
+                        style={
+                          active
+                            ? { borderColor: "rgba(154,230,0,0.5)", color: "#c6ff45", background: "rgba(154,230,0,0.08)" }
+                            : undefined
+                        }
+                      >
+                        {preset.label}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setTuning((value) => !value)}
+                  className="mt-2 flex w-full items-center justify-between text-[11px] font-medium text-mist-300 transition hover:text-mist-100"
+                  aria-expanded={tuning}
+                >
+                  <span>Fine tune</span>
+                  <span className={`text-mist-500 transition-transform ${tuning ? "rotate-180" : ""}`}>
+                    <svg viewBox="0 0 24 24" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="m6 9 6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
                   </span>
-                </span>
-              </label>
+                </button>
+
+                {tuning ? (
+                  <div className="mt-2 grid gap-2.5">
+                    <label className="flex cursor-pointer items-start gap-2">
+                      <input
+                        type="checkbox"
+                        checked={filters.matte}
+                        onChange={(event) => {
+                          setActivePresetId("custom");
+                          onFiltersChange({ matte: event.target.checked });
+                        }}
+                        className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-lime-glow"
+                      />
+                      <span className="min-w-0">
+                        <span className="block text-[11.5px] font-medium text-mist-100">Cut the background out</span>
+                        <span className="mono block truncate text-[10px] text-mist-500">
+                          {image.matte
+                            ? `matte on · ${image.matte.removed} island${image.matte.removed === 1 ? "" : "s"} removed · object ${(image.matte.coverage * 100).toFixed(0)}% of frame`
+                            : "matte off · original background kept"}
+                        </span>
+                      </span>
+                    </label>
+
+                    <label className="flex cursor-pointer items-center justify-between gap-2">
+                      <span className="text-[11.5px] font-medium text-mist-100">Auto levels</span>
+                      <input
+                        type="checkbox"
+                        checked={filters.autoLevels}
+                        onChange={(event) => {
+                          setActivePresetId("custom");
+                          onFiltersChange({ autoLevels: event.target.checked });
+                        }}
+                        className="h-3.5 w-3.5 accent-lime-glow"
+                      />
+                    </label>
+
+                    <MiniSlider
+                      label="Exposure"
+                      value={filters.brightness}
+                      min={-50}
+                      max={50}
+                      onChange={(value) => {
+                        setActivePresetId("custom");
+                        onFiltersChange({ brightness: value });
+                      }}
+                    />
+                    <MiniSlider
+                      label="Contrast"
+                      value={filters.contrast}
+                      min={-50}
+                      max={50}
+                      onChange={(value) => {
+                        setActivePresetId("custom");
+                        onFiltersChange({ contrast: value });
+                      }}
+                    />
+                    <MiniSlider
+                      label="Saturation"
+                      value={filters.saturation}
+                      min={-50}
+                      max={50}
+                      onChange={(value) => {
+                        setActivePresetId("custom");
+                        onFiltersChange({ saturation: value });
+                      }}
+                    />
+                    <MiniSlider
+                      label="Sharpen"
+                      value={filters.sharpen}
+                      min={0}
+                      max={100}
+                      onChange={(value) => {
+                        setActivePresetId("custom");
+                        onFiltersChange({ sharpen: value });
+                      }}
+                    />
+
+                    <div>
+                      <span className="text-[11.5px] font-medium text-mist-100">Backdrop</span>
+                      <div className="mt-1 grid grid-cols-4 gap-1.5">
+                        {(Object.keys(PLATE_COLORS) as PlateColor[]).map((plate) => (
+                          <button
+                            key={plate}
+                            type="button"
+                            onClick={() => {
+                              setActivePresetId("custom");
+                              onFiltersChange({ plate });
+                            }}
+                            className="flex items-center justify-center gap-1 rounded-lg border py-1 text-[10px] capitalize transition"
+                            style={{
+                              borderColor: filters.plate === plate ? "rgba(154,230,0,0.5)" : "rgba(255,255,255,0.1)",
+                              color: filters.plate === plate ? "#c6ff45" : "rgba(179,192,212,0.9)",
+                            }}
+                          >
+                            <span
+                              className="h-2.5 w-2.5 rounded-full border border-white/20"
+                              style={{ background: PLATE_COLORS[plate] }}
+                            />
+                            {plate}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="justify-self-start text-[10.5px] font-medium text-mist-500 underline decoration-white/20 underline-offset-2 hover:text-mist-100"
+                      onClick={() => {
+                        setActivePresetId("raw");
+                        onPreset(RAW_FILTERS);
+                      }}
+                    >
+                      Reset to raw upload
+                    </button>
+                  </div>
+                ) : null}
+              </div>
 
               {image.originalDataUrl ? (
                 <div className="flex items-center gap-2 border-t border-white/[0.06] px-3 py-2">
@@ -406,7 +563,8 @@ export function ControlDeck(props: Props) {
               </span>
               <span className="text-[13px] font-medium text-mist-100">Drop an image, or click to browse</span>
               <span className="max-w-[15rem] text-[11px] leading-relaxed text-mist-500">
-                One object, plain background, three-quarter view. PNG · JPG · WEBP — auto-fitted to 1024².
+                One object, three-quarter view. PNG · JPG · WEBP — auto-fitted to 1024², background cut out and
+                tone-corrected before it is sent.
               </span>
             </button>
           )}
@@ -693,5 +851,55 @@ export function ControlDeck(props: Props) {
         </div>
       ) : null}
     </section>
+  );
+}
+
+/** Which preset the current filter values correspond to (or "custom"). */
+function matchingPresetId(filters: FilterSettings): string {
+  const match = FILTER_PRESETS.find(
+    (preset) =>
+      preset.filters.matte === filters.matte &&
+      preset.filters.plate === filters.plate &&
+      preset.filters.autoLevels === filters.autoLevels &&
+      preset.filters.brightness === filters.brightness &&
+      preset.filters.contrast === filters.contrast &&
+      preset.filters.saturation === filters.saturation &&
+      preset.filters.sharpen === filters.sharpen,
+  );
+  return match ? match.id : "custom";
+}
+
+function MiniSlider({
+  label,
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (value: number) => void;
+}) {
+  const percent = ((value - min) / (max - min)) * 100;
+  return (
+    <label className="block">
+      <span className="flex items-baseline justify-between">
+        <span className="text-[11.5px] font-medium text-mist-100">{label}</span>
+        <span className="mono text-[10px] text-lime-glow/90">{value > 0 ? `+${value}` : value}</span>
+      </span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={1}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+        style={{ ["--fill" as string]: `${percent}%` }}
+        className="mt-0.5"
+        aria-label={label}
+      />
+    </label>
   );
 }

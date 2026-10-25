@@ -24,6 +24,10 @@ on the server: it is read from the Vercel environment and never shipped to the b
 - **Inputs are prepared for you** — every upload is fitted to a 1 MP square (TRELLIS's documented
   sweet spot), and an auto-matte removes the background, a planet, stars and other scenery by keeping the
   centred object's connected components. The panel shows *exactly* what TRELLIS will see, before you spend a call.
+- **Filters on the reference image** — presets (Studio / Clean cut / Rescue dark / Silhouette / Raw) plus
+  fine-tune sliders for auto-levels, exposure, contrast, saturation, sharpen and backdrop colour. Filters
+  always re-process from the original file (never stacked), run entirely in the browser, and the preview
+  updates to the exact JPEG that will be sent.
 - **Multi-view lifts** — add up to two extra views (front / top / side). TRELLIS averages up to 8 views,
   which is the single biggest quality win on elongated subjects like ships.
 - **Real 3D viewport** — three.js + PBR environment lighting, orbit/zoom, auto-rotate, ground grid,
@@ -134,9 +138,9 @@ components/
   ViewerStage.tsx        viewport shell, toolbar, stats, download
   ThreeViewer.tsx        three.js scene, GLTF parsing, materials
 lib/
-  nim.ts                 server-only NIM client (retries, NVCF polling, error mapping)
+  nim.ts                 server-only NIM client (retries, payload ladder, NVCF polling, error mapping)
   client.ts              browser fetch helpers + header metadata decoding
-  image.ts               upload downscale + background flattening
+  image.ts               upload fitting, background matte, filter presets + pure pixel maths
   types.ts               shared types and formatting helpers
 public/demo.glb          bundled sample asset
 scripts/make-demo-glb.mjs regenerates the sample asset
@@ -171,6 +175,7 @@ The studio reports NVIDIA's own validation text (the `detail` field) in the erro
 | `422` after touching CFG | `slat_cfg_scale` / `ss_cfg_scale` are `exclusiveMinimum: 1.0`, so `1` is invalid. | Both are clamped to `1.05 … 10` server-side; the sliders can no longer produce an invalid value. |
 | `422` on a big upload | TRELLIS expects ~1 MP. A 597×335 screenshot is 0.2 MP and not square. | Uploads are re-fitted into a 1024² JPEG (upscaling allowed) before sending. |
 | `422`/weird mesh from a scene photo | Background, planet, glows confuse the reconstruction. | Auto-matte keeps the centred object only; toggle it off to send the raw frame. The preview shows the difference. |
+| Dark or busy screenshot lifts badly | Low contrast hides hull detail, and a planet/starfield competes with the subject. | Filter presets + percentile auto-levels + auto-matte. The stretch is 2 %/98 % and skips near-flat images, so it cannot amplify noise. |
 | `504` / "ran past the function time limit" | Vercel stops functions at 60 s on Hobby (300 s on Pro). TRELLIS can take 20–90 s. | The studio retries once automatically at **Fast 15** steps, and the Speed preset lets you pick 15 / 25 / 35 up front. |
 | `429` | Hosted NIM rate limit per model. | One automatic retry with backoff, then a message with a wait hint. |
 | `CONTENT_FILTERED` | Prompt tripped the safety checker. | Surfaced as its own error with rewrite advice. |

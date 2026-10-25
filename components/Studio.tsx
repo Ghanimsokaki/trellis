@@ -6,7 +6,12 @@ import { HistoryRail } from "@/components/HistoryRail";
 import { ViewerStage } from "@/components/ViewerStage";
 import type { DisplayMode, MeshStats, ViewerStatus } from "@/components/ThreeViewer";
 import { IconCube, IconExternal, IconKey } from "@/components/Icons";
-import { prepareImageFile, type PreparedImage } from "@/lib/image";
+import {
+  DEFAULT_FILTERS,
+  prepareImageFile,
+  type FilterSettings,
+  type PreparedImage,
+} from "@/lib/image";
 import { ApiFailure, isAbort, requestConcept, requestMesh, slugifyPrompt } from "@/lib/client";
 import { EXAMPLE_PROMPT } from "@/lib/presets";
 import {
@@ -74,7 +79,7 @@ export function Studio({ initialHealth }: Props) {
   const [rawFile, setRawFile] = useState<File | null>(null);
   const [extraFiles, setExtraFiles] = useState<File[]>([]);
   const [extraViews, setExtraViews] = useState<PreparedImage[]>([]);
-  const [matte, setMatte] = useState(true);
+  const [filters, setFilters] = useState<FilterSettings>(DEFAULT_FILTERS);
   const [preparing, setPreparing] = useState(false);
   const [imageError, setImageError] = useState<string | null>(null);
 
@@ -155,11 +160,11 @@ export function Studio({ initialHealth }: Props) {
     return nextAsset;
   }, []);
 
-  const prepare = useCallback(async (file: File, useMatte: boolean) => {
+  const prepare = useCallback(async (file: File, nextFilters: FilterSettings) => {
     setPreparing(true);
     setImageError(null);
     try {
-      const prepared = await prepareImageFile(file, { matte: useMatte });
+      const prepared = await prepareImageFile(file, { filters: nextFilters });
       setImage(prepared);
       return prepared;
     } catch (fileError) {
@@ -175,12 +180,12 @@ export function Studio({ initialHealth }: Props) {
       setMode("image");
       setError(null);
       setRawFile(file);
-      const prepared = await prepare(file, matte);
-      if (prepared && !prepared.matte && matte) {
-        setImageError("Could not separate a clean object — the background is not uniform. Upload a single object on a plain background.");
+      const prepared = await prepare(file, filters);
+      if (prepared && !prepared.matte && filters.matte) {
+        setImageError("Could not separate a clean object — the background is not uniform. Try the Raw preset, or upload the object on a plain background.");
       }
     },
-    [matte, prepare],
+    [filters, prepare],
   );
 
   const handleAddView = useCallback(
@@ -188,14 +193,14 @@ export function Studio({ initialHealth }: Props) {
       if (extraFiles.length >= 2) return;
       setImageError(null);
       try {
-        const prepared = await prepareImageFile(file, { matte });
+        const prepared = await prepareImageFile(file, { filters });
         setExtraFiles((previous) => [...previous, file].slice(0, 2));
         setExtraViews((previous) => [...previous, prepared].slice(0, 2));
       } catch (viewError) {
         setImageError(viewError instanceof Error ? viewError.message : "Could not read that view.");
       }
     },
-    [extraFiles.length, matte],
+    [extraFiles.length, filters],
   );
 
   const handleRemoveView = useCallback((index: number) => {
@@ -203,18 +208,39 @@ export function Studio({ initialHealth }: Props) {
     setExtraViews((previous) => previous.filter((_, position) => position !== index));
   }, []);
 
-  const handleMatteChange = useCallback(
-    (value: boolean) => {
-      setMatte(value);
+  const reworkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
+  /**
+   * Filters are cheap (a 1 MP tone-map), so re-process from the original file
+   * — debounced — instead of stacking adjustments on an already-filtered canvas.
+   */
+  const handleFiltersChange = useCallback(
+    (patch: Partial<FilterSettings>) => {
+      const next = { ...filtersRef.current, ...patch };
+      setFilters(next);
       setImageError(null);
-      if (rawFile) void prepare(rawFile, value);
-      if (extraFiles.length > 0) {
-        void Promise.all(extraFiles.map((file) => prepareImageFile(file, { matte: value })))
-          .then((prepared) => setExtraViews(prepared.filter((entry): entry is PreparedImage => entry !== null)))
-          .catch(() => undefined);
-      }
+      if (!rawFile) return;
+
+      if (reworkTimer.current) clearTimeout(reworkTimer.current);
+      reworkTimer.current = setTimeout(() => {
+        void prepare(rawFile, next);
+        if (extraFiles.length > 0) {
+          void Promise.all(extraFiles.map((file) => prepareImageFile(file, { filters: next })))
+            .then((prepared) => setExtraViews(prepared))
+            .catch(() => undefined);
+        }
+      }, 140);
     },
     [extraFiles, prepare, rawFile],
+  );
+
+  const handlePreset = useCallback(
+    (presetFilters: FilterSettings) => {
+      handleFiltersChange(presetFilters);
+    },
+    [handleFiltersChange],
   );
 
   const run = useCallback(async (overrides?: Partial<GenSettings>, attempt = 0) => {
@@ -525,8 +551,9 @@ export function Studio({ initialHealth }: Props) {
               setExtraViews([]);
             }}
             imageError={imageError}
-            matte={matte}
-            onMatteChange={handleMatteChange}
+            filters={filters}
+            onFiltersChange={handleFiltersChange}
+            onPreset={handlePreset}
             preparing={preparing}
             extraViews={extraViews}
             onAddView={(file) => void handleAddView(file)}
