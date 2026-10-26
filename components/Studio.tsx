@@ -41,7 +41,9 @@ function shortModel(id: string): string {
 function buildPlan(mode: Mode, engine: EngineChoice, imageModel: string): Plan {
   if (mode === "image") {
     return [
-      { label: "Image → 3D", detail: "TRELLIS image-large · lifting to mesh" },
+      { label: "Perceive", detail: "vision layer · reading the photo" },
+      { label: "Resolve", detail: "reference search · picking a compatible route" },
+      { label: "Forge", detail: "TRELLIS · building the mesh" },
       { label: "Preview", detail: "parsing GLB & PBR materials" },
     ];
   }
@@ -53,7 +55,8 @@ function buildPlan(mode: Mode, engine: EngineChoice, imageModel: string): Plan {
   }
   return [
     { label: "Concept render", detail: `${shortModel(imageModel)} · 1024²` },
-    { label: "Image → 3D", detail: "TRELLIS image-large · lifting to mesh" },
+    { label: "Perceive", detail: "vision layer · reading the render" },
+    { label: "Forge", detail: "TRELLIS · lifting to mesh" },
     { label: "Preview", detail: "parsing GLB & PBR materials" },
   ];
 }
@@ -297,8 +300,9 @@ export function Studio({ initialHealth }: Props) {
         imageData = conceptResult.image;
       }
 
-      const trellisIndex = mode === "prompt" && engine === "pipeline" ? 1 : 0;
-      setStages(toStages(plan, trellisIndex));
+      // The server runs the whole layer stack inside this one request, so park the
+      // indicator on the forge step (everything before it is already reported done).
+      setStages(toStages(plan, Math.max(plan.length - 2, 0)));
 
       const payload =
         mode === "prompt" && engine === "trellis-text"
@@ -597,6 +601,7 @@ export function Studio({ initialHealth }: Props) {
             onRun={() => void run()}
             onCancel={cancel}
             configured={health.configured}
+            trellisImageMode={health.trellisImageMode}
             imageModel={imageModel}
             imageModels={health.imageModels}
             onImageModelChange={setImageModel}

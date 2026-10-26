@@ -1,5 +1,5 @@
 import { jsonError, readJsonBody, validationError } from "@/lib/http";
-import { generateMesh } from "@/lib/nim";
+import { runLayeredForge, type ForgeInput } from "@/lib/pipeline";
 import type { EngineId, GenSettings, MeshMeta } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -17,6 +17,10 @@ type GenerateBody = {
   imageModel?: string | null;
   conceptPrompt?: string | null;
   settings?: Partial<GenSettings>;
+  /** set false to skip the resolve layer's web search */
+  search?: boolean;
+  /** set false to bypass the layered forge (single-shot TRELLIS call) */
+  layered?: boolean;
 };
 
 /** Vercel caps serverless request bodies at 4.5 MB; stay under it in base64 chars. */
@@ -67,20 +71,21 @@ export async function POST(request: Request) {
     }
 
     const single = (body.image ?? "").trim();
-    const input =
+    const input: ForgeInput =
       mode === "text"
-        ? ({ mode: "text", prompt } as const)
-        : ({
+        ? { mode: "text", prompt, engine }
+        : {
             mode: "image",
             image: images[0] ?? single,
             images: images.length > 0 ? images : undefined,
             prompt: prompt || null,
-          } as const);
+            engine,
+          };
 
-    const { glb, meta } = await generateMesh(input, body.settings, {
-      engine,
+    const { glb, meta } = await runLayeredForge(input, body.settings, {
       imageModel: mode === "image" ? body.imageModel ?? null : null,
       conceptPrompt: body.conceptPrompt ?? null,
+      search: body.search,
     });
 
     const filename = `trellis-${meta.seed || "random"}-${Date.now().toString(36)}.glb`;

@@ -28,6 +28,12 @@ export const TRELLIS_MODEL = process.env.NVIDIA_TRELLIS_MODEL || "microsoft/trel
 /** Small hosted chat model used to rewrite/expand prompts. */
 export const ENHANCE_MODEL = process.env.NVIDIA_ENHANCE_MODEL || "meta/llama-3.1-8b-instruct";
 
+/** Vision-language model used by the perceive layer of the layered forge. */
+export const VISION_MODEL = process.env.NVIDIA_VISION_MODEL || "meta/llama-3.2-11b-vision-instruct";
+
+/** Hosted TRELLIS validates `prompt` with length ≤ 77. */
+export const TRELLIS_PROMPT_MAX = 77;
+
 /**
  * Text-to-image NIMs used for the concept render stage. Both are free to call
  * with a build.nvidia.com key; `steps` stays inside each model's schema limits.
@@ -422,6 +428,28 @@ export function normalizeSettings(input?: Partial<GenSettings>): GenSettings {
 }
 
 /** Prompt used for the 2D concept render that TRELLIS lifts into 3D. */
+/**
+ * TRELLIS rejects prompts longer than 77 characters, and it rejects the whole
+ * request (422) rather than truncating. Trim on a word boundary and drop
+ * trailing filler so the surviving text still reads as a description.
+ */
+export function clampTrellisPrompt(prompt: string): string {
+  const flat = prompt.replace(/\s+/g, " ").trim();
+  if (flat.length <= TRELLIS_PROMPT_MAX) return flat;
+
+  const words = flat.split(" ");
+  const kept: string[] = [];
+  for (const word of words) {
+    const next = [...kept, word].join(" ");
+    if (next.length > TRELLIS_PROMPT_MAX) break;
+    kept.push(word);
+  }
+  const clipped = (kept.length > 0 ? kept.join(" ") : flat.slice(0, TRELLIS_PROMPT_MAX))
+    .replace(/[,;:.\-\s]+$/, "")
+    .trim();
+  return clipped || flat.slice(0, TRELLIS_PROMPT_MAX);
+}
+
 export function buildConceptPrompt(prompt: string): string {
   return `${prompt.trim().replace(/\s+/g, " ").replace(/[.\s]+$/, "")}, ${conceptSuffix("three-quarter")}`;
 }
@@ -542,7 +570,7 @@ function buildTrellisPayload(input: MeshInput, settings: GenSettings | null): Tr
   const media: TrellisPayload =
     input.mode === "image"
       ? { image: input.images && input.images.length > 1 ? input.images : input.image }
-      : { prompt: input.prompt };
+      : { prompt: clampTrellisPrompt(input.prompt) };
 
   const body: TrellisPayload = { ...media, seed: settings?.seed ?? 0 };
   if (!settings) return body;
@@ -865,4 +893,58 @@ export async function enhancePrompt(
   }
 
   return { prompt: cleaned.slice(0, 600), model: ENHANCE_MODEL, elapsedMs: Date.now() - started };
+}
+
+export type ChatMessage = {
+  role: "system" | "user" | "assistant";
+  content: string | Array<Record<string, unknown>>;
+};
+
+/**
+ * OpenAI-compatible chat call against the hosted integrate endpoint.
+ * Used by the perceive (vision) and resolve layers.
+ */
+export async function chatNim(
+  messages: ChatMessage[],
+  options: {
+    model?: string;
+    timeoutMs?: number;
+    label?: string;
+    temperature?: number;
+    maxTokens?: number;
+    responseFormat?: "json" | null;
+  } = {},
+): Promise<{ content: string; model: string; requestId: string | null; elapsedMs: number }> {
+  const started = Date.now();
+  const model = options.model || ENHANCE_MODEL;
+
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    temperature: options.temperature ?? 0.2,
+    top_p: 0.9,
+    max_tokens: options.maxTokens ?? 700,
+    stream: false,
+  };
+  if (options.responseFormat === "json") body.response_format = { type: "json_object" };
+
+  const { payload, requestId } = await callNim(`${CHAT_BASE}/chat/completions`, body, {
+    timeoutMs: options.timeoutMs ?? 45_000,
+    label: options.label ?? "Chat",
+    retries: 1,
+  });
+
+  const choices = Array.isArray(payload.choices) ? payload.choices : [];
+  const message = (choices[0] as Record<string, unknown> | undefined)?.message as Record<string, unknown> | undefined;
+  const content = typeof message?.content === "string" ? message.content : "";
+
+  if (!content.trim()) {
+    throw new NimError(`${options.label ?? "Chat"} returned an empty message.`, {
+      status: 502,
+      code: "chat_empty",
+      requestId: requestId ?? undefined,
+    });
+  }
+
+  return { content, model, requestId: requestId ?? null, elapsedMs: Date.now() - started };
 }

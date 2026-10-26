@@ -138,6 +138,8 @@ export async function requestMesh(
     imageModel?: string | null;
     conceptPrompt?: string | null;
     settings: GenSettings;
+    /** set false to skip the resolve layer's web search */
+    search?: boolean;
   },
   signal: AbortSignal,
 ): Promise<{ blob: Blob; meta: MeshMeta }> {

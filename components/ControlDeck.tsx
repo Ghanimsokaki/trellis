@@ -66,6 +66,8 @@ type Props = {
   onRun: () => void;
   onCancel: () => void;
   configured: boolean;
+  /** "native" = the photo itself conditions TRELLIS; "caption" = described first. */
+  trellisImageMode: "native" | "caption";
   imageModel: string;
   imageModels: string[];
   onImageModelChange: (id: string) => void;
@@ -171,6 +173,7 @@ export function ControlDeck(props: Props) {
     onRun,
     onCancel,
     configured,
+    trellisImageMode,
     imageModel,
     imageModels,
     onImageModelChange,
@@ -360,7 +363,7 @@ export function ControlDeck(props: Props) {
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={image.dataUrl} alt="Prepared reference" className="h-full w-full object-contain" />
                 <span className="absolute left-2 top-2 rounded-full border border-lime-glow/30 bg-ink-950/80 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-lime-glow">
-                  what TRELLIS sees
+                  {trellisImageMode === "native" ? "what TRELLIS sees" : "vision layer input"}
                 </span>
                 <button
                   type="button"
@@ -384,6 +387,17 @@ export function ControlDeck(props: Props) {
                   {image.width}×{image.height}
                 </span>
               </div>
+
+              {trellisImageMode === "caption" ? (
+                <div className="border-t border-white/[0.06] px-3 py-2">
+                  <p className="text-[10.5px] leading-relaxed text-amber-200/80">
+                    NVIDIA&apos;s hosted TRELLIS preview only reconstructs its own catalogue images. The forge reads this
+                    photo with a vision model and rebuilds it from that description — set{" "}
+                    <span className="mono text-[10px] text-amber-100">NVIDIA_TRELLIS_INFER_URL</span> for photo-exact
+                    meshes.
+                  </p>
+                </div>
+              ) : null}
 
               <div className="border-t border-white/[0.06] px-3 py-2.5">
                 <div className="flex items-center justify-between">

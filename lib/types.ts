@@ -26,6 +26,41 @@ export const DEFAULT_SETTINGS: GenSettings = {
   ssCfg: 7.5,
 };
 
+/** What the vision layer saw in the reference photo. */
+export type ImageSpec = {
+  subject: string;
+  category: string;
+  silhouette: string;
+  parts: string[];
+  palette: string[];
+  material: string;
+  /** TRELLIS text mode is capped at 77 characters. */
+  prompt: string;
+  /** Queries the resolver layer runs against the web when search is configured. */
+  queries: string[];
+  confidence: number;
+  notes?: string;
+};
+
+/** One executed layer of the multi-layer forge. */
+export type LayerInfo = {
+  id: string;
+  label: string;
+  state: "done" | "skipped" | "failed";
+  detail: string;
+  ms: number;
+};
+
+/** Which pipeline produced the mesh, and how faithful it can be to the photo. */
+export type ForgeRoute =
+  | "image-native"
+  | "caption-bridge"
+  | "text-only";
+
+export type Fidelity = "exact" | "approximate" | "described";
+
+export type SourceRef = { title: string; url: string };
+
 export type MeshMeta = {
   engine: EngineId;
   mode: "text" | "image";
@@ -40,6 +75,14 @@ export type MeshMeta = {
   createdAt: string;
   /** How the reference image reached hosted TRELLIS: NVCF asset upload or inline base64. */
   imageRef?: "asset" | "inline";
+  /** Multi-layer forge bookkeeping. */
+  route?: ForgeRoute;
+  fidelity?: Fidelity;
+  layers?: LayerInfo[];
+  spec?: ImageSpec | null;
+  sources?: SourceRef[];
+  /** Vision-language model used by the perceive layer. */
+  visionModel?: string | null;
 };
 
 export type ConceptResponse = {
@@ -64,6 +107,10 @@ export type HealthResponse = {
   /** Where reference images are sent: NVCF asset storage, or inline for self-hosted. */
   imageTransport: "asset" | "inline";
   assetsBase: string;
+  /** Can the photo itself condition the mesh, or must it go through the caption bridge? */
+  trellisImageMode: "native" | "caption";
+  visionModel: string;
+  searchProvider: string;
 };
 
 export type StepState = "idle" | "active" | "done" | "error";
