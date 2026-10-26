@@ -9,6 +9,7 @@ import {
   type ViewerStatus,
 } from "@/components/ThreeViewer";
 import { EXPORT_FORMATS, exportMesh, saveExport, saveSnapshot, type ExportFormat } from "@/lib/export";
+import { LayerReport } from "@/components/LayerReport";
 import {
   IconCheck,
   IconCube,
@@ -282,6 +283,12 @@ export function ViewerStage(props: Props) {
                 </button>
               </div>
             </div>
+          </div>
+        ) : null}
+
+        {asset && !busy ? (
+          <div className="pointer-events-none absolute bottom-14 left-3 z-10 hidden sm:block">
+            <LayerReport meta={asset.meta} />
           </div>
         ) : null}
 

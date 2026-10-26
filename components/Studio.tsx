@@ -12,7 +12,15 @@ import {
   type FilterSettings,
   type PreparedImage,
 } from "@/lib/image";
-import { ApiFailure, isAbort, requestConcept, requestEnhance, requestMesh, slugifyPrompt } from "@/lib/client";
+import {
+  ApiFailure,
+  isAbort,
+  requestConcept,
+  requestEnhance,
+  requestMesh,
+  requestViews,
+  slugifyPrompt,
+} from "@/lib/client";
 import { EXAMPLE_PROMPT } from "@/lib/presets";
 import {
   DEFAULT_SETTINGS,
@@ -41,7 +49,9 @@ function shortModel(id: string): string {
 function buildPlan(mode: Mode, engine: EngineChoice, imageModel: string): Plan {
   if (mode === "image") {
     return [
-      { label: "Image → 3D", detail: "TRELLIS image-large · lifting to mesh" },
+      { label: "Perceive", detail: "vision layer · reading the photo" },
+      { label: "Resolve", detail: "reference search · picking a compatible route" },
+      { label: "Forge", detail: "TRELLIS · building the mesh" },
       { label: "Preview", detail: "parsing GLB & PBR materials" },
     ];
   }
@@ -53,7 +63,8 @@ function buildPlan(mode: Mode, engine: EngineChoice, imageModel: string): Plan {
   }
   return [
     { label: "Concept render", detail: `${shortModel(imageModel)} · 1024²` },
-    { label: "Image → 3D", detail: "TRELLIS image-large · lifting to mesh" },
+    { label: "Perceive", detail: "vision layer · reading the render" },
+    { label: "Forge", detail: "TRELLIS · lifting to mesh" },
     { label: "Preview", detail: "parsing GLB & PBR materials" },
   ];
 }
@@ -79,6 +90,8 @@ export function Studio({ initialHealth }: Props) {
   const [rawFile, setRawFile] = useState<File | null>(null);
   const [extraFiles, setExtraFiles] = useState<File[]>([]);
   const [extraViews, setExtraViews] = useState<PreparedImage[]>([]);
+  const [synthesizing, setSynthesizing] = useState(false);
+  const [synthNote, setSynthNote] = useState<string | null>(null);
   const [filters, setFilters] = useState<FilterSettings>(DEFAULT_FILTERS);
   const [preparing, setPreparing] = useState(false);
   const [enhancing, setEnhancing] = useState(false);
@@ -210,6 +223,53 @@ export function Studio({ initialHealth }: Props) {
     setExtraViews((previous) => previous.filter((_, position) => position !== index));
   }, []);
 
+  /**
+   * Kontext asks for extra camera angles so TRELLIS has more than one view.
+   * On the hosted preview this is usually refused (it only edits catalogue
+   * images); the note explains that instead of pretending it worked.
+   */
+  const handleSynthesizeViews = useCallback(async () => {
+    if (!image || synthesizing) return;
+    const room = 2 - extraViews.length;
+    if (room <= 0) {
+      setSynthNote("You already have two extra views — remove one to make room.");
+      return;
+    }
+    setSynthesizing(true);
+    setSynthNote(null);
+    try {
+      const lastSpec = asset?.meta.spec ?? null;
+      const result = await requestViews({
+        image: image.dataUrl,
+        subject: lastSpec?.subject ?? undefined,
+        material: lastSpec?.material ?? undefined,
+        count: room,
+        seed: settings.seed || undefined,
+      });
+      const views = result.views.slice(0, room).map((view) => ({
+        dataUrl: view.dataUrl,
+        originalDataUrl: view.dataUrl,
+        name: `synthesized ${view.label}`,
+        width: 1024,
+        height: 1024,
+        bytes: Math.round((view.dataUrl.length * 3) / 4),
+        matte: null,
+        filters: DEFAULT_FILTERS,
+      }));
+      if (views.length === 0) {
+        setSynthNote(result.skipped ?? "Kontext produced no extra angles.");
+      } else {
+        setExtraViews((previous) => [...previous, ...views].slice(0, 2));
+        notify(`${views.length} synthesized view${views.length === 1 ? "" : "s"} added — they ride along on the next forge`);
+        if (result.skipped) setSynthNote(result.skipped);
+      }
+    } catch (viewError) {
+      setSynthNote(viewError instanceof Error ? viewError.message : "View synthesis failed.");
+    } finally {
+      setSynthesizing(false);
+    }
+  }, [asset, extraViews.length, image, notify, settings.seed, synthesizing]);
+
   const reworkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const filtersRef = useRef(filters);
   filtersRef.current = filters;
@@ -297,8 +357,9 @@ export function Studio({ initialHealth }: Props) {
         imageData = conceptResult.image;
       }
 
-      const trellisIndex = mode === "prompt" && engine === "pipeline" ? 1 : 0;
-      setStages(toStages(plan, trellisIndex));
+      // The server runs the whole layer stack inside this one request, so park the
+      // indicator on the forge step (everything before it is already reported done).
+      setStages(toStages(plan, Math.max(plan.length - 2, 0)));
 
       const payload =
         mode === "prompt" && engine === "trellis-text"
@@ -589,6 +650,10 @@ export function Studio({ initialHealth }: Props) {
             extraViews={extraViews}
             onAddView={(file) => void handleAddView(file)}
             onRemoveView={handleRemoveView}
+            onSynthesizeViews={() => void handleSynthesizeViews()}
+            synthesizing={synthesizing}
+            synthNote={synthNote}
+            viewSynthesis={health.viewSynthesis}
             busy={busy}
             stages={stages}
             elapsedMs={elapsedMs}
@@ -597,6 +662,7 @@ export function Studio({ initialHealth }: Props) {
             onRun={() => void run()}
             onCancel={cancel}
             configured={health.configured}
+            trellisImageMode={health.trellisImageMode}
             imageModel={imageModel}
             imageModels={health.imageModels}
             onImageModelChange={setImageModel}

@@ -112,8 +112,44 @@ Node.js route handler.
 | `NVIDIA_CHAT_BASE` | | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible base for prompt enhancement |
 | `NVIDIA_ENHANCE_MODEL` | | `meta/llama-3.1-8b-instruct` | Chat model used by **Enhance** |
 | `NVIDIA_MAX_DURATION` | | `300` | Cosmetic; shown in the footer |
+| `NVIDIA_KONTEXT_URL` | | — | Self-hosted Kontext NIM (`http://host:8000/v1/infer`) used by **Synthesize views**; the hosted preview only edits catalogue images |
+| `NVIDIA_SYNTH_VIEWS` | | `auto` | `off` disables Kontext view synthesis |
+| `NVIDIA_SYNTH_VIEW_COUNT` | | `2` | How many extra angles to render (1–4) |
+| `NVIDIA_VISION_MODEL` | | `meta/llama-3.2-11b-vision-instruct` | Vision NIM used by the **Perceive** layer |
+| `NVIDIA_TRELLIS_IMAGE_MODE` | | `auto` | `always` = attempt hosted image mode before the caption bridge |
+| `TRELLIS_SEARCH` | | `auto` | `off` skips the **Resolve** layer's web search |
+| `BRAVE_SEARCH_API_KEY` | | — | Resolve layer via Brave Search |
+| `TAVILY_API_KEY` | | — | Resolve layer via Tavily |
+| `SERPER_API_KEY` | | — | Resolve layer via Serper |
+| `TRELLIS_SEARCH_PROVIDER` | | auto-detected | Force `brave`/`tavily`/`serper`/`duckduckgo`/`mock` |
 
 ---
+
+## The multi-layer forge
+
+NVIDIA's hosted TRELLIS preview is explicit in its schema: *"Preview API NIM supports only a predefined set of
+images. The image should be in form of `data:image/png;example_id,{example_id}` with example_id in a range
+[0,3]"*. Inline base64 and NVCF assets are both rejected with `422 Expected: example_id`. A user photo therefore
+cannot be lifted to a mesh on the hosted endpoint — so the app runs it through layers instead of failing:
+
+| Layer | What it does | Model |
+| --- | --- | --- |
+| **Perceive** | Reads the photo: subject, silhouette, parts, palette, plus a ≤77-char prompt and web queries | `meta/llama-3.2-11b-vision-instruct` (chat NIM) |
+| **Resolve** | Searches the web for more references and matching 3D models (Brave / Tavily / Serper, or keyless DuckDuckGo) | search provider, optional |
+| **Synthesize views** | Optional: turns the photo into extra camera angles (left side, rear) so TRELLIS has more than one view — self-hosted Kontext only in practice | `black-forest-labs/flux.1-kontext-dev` |
+| **Forge** | TRELLIS image mode with the photo **and the synthesized angles** (self-hosted only), else TRELLIS text mode on the description | `microsoft/trellis` |
+| **Report** | Route, fidelity, per-layer timings and the references found, shown in the viewport | — |
+
+Fidelity is reported, not implied:
+
+- **photo-exact** — `NVIDIA_TRELLIS_INFER_URL` points at your own TRELLIS NIM; the photo (plus any uploaded or
+  Kontext-synthesized angles, up to 4 views) conditions the mesh.
+- **from description** — hosted preview; the vision layer's description drives a text-mode mesh.
+- **prompt → mesh** — text-only generation.
+
+The forge also clamps every prompt to TRELLIS' 77-character limit, keeps a 422 from the image branch as a signal
+to switch to the caption bridge (`NVIDIA_TRELLIS_IMAGE_MODE=always` opts into trying image mode on the hosted
+gateway), and degrades the vision layer to your written brief if the chat model is unavailable.
 
 ## How it works
 
@@ -131,8 +167,9 @@ browser ──► /api/generate ──► ai.api.nvidia.com/v1/genai/microsoft/t
 | --- | --- | --- |
 | `GET /api/health` | — | `{ configured, authVariable, trellisModel, imageModel, imageModels, apiBase, maxDurationSeconds }` |
 | `POST /api/concept` | `{ prompt, settings, imageModel }` | `{ image, prompt, rawPrompt, seed, model, elapsedMs }` |
+| `POST /api/views` | `{ image, subject?, material?, count?, seed? }` | `{ views: [{ dataUrl, label }], model, mode, skipped, elapsedMs }` |
 | `POST /api/enhance` | `{ prompt, offline? }` | `{ prompt, original, model, elapsedMs, offline, addedShapeWords, fallbackReason? }` — always `200`: the LLM path degrades to the offline composer |
-| `POST /api/generate` | `{ mode: "text" \| "image", prompt?, image?, engine, imageModel?, conceptPrompt?, settings }` | binary **GLB** (`model/gltf-binary`) with generation metadata in `X-Trellis-Meta` (base64 JSON) |
+| `POST /api/generate` | `{ mode: "text" \| "image", prompt?, image?, images?, engine, imageModel?, conceptPrompt?, settings, search?, views? }` | binary **GLB** (`model/gltf-binary`) with generation metadata in `X-Trellis-Meta` (base64 JSON) |
 
 TRELLIS request fields map straight to the NIM schema: `mode`, `image`/`prompt`, `seed`,
 `slat_cfg_scale`, `ss_cfg_scale`, `slat_sampling_steps`, `ss_sampling_steps`.
@@ -193,6 +230,7 @@ The studio reports NVIDIA's own validation text (the `detail` field) in the erro
 | --- | --- | --- |
 | `422` / "could not use the request payload" | The hosted gateway validates stricter than the container docs. Extra fields (`mode`, tuned CFG/steps) can be rejected. | Requests start from the documented minimal body (`image`/`prompt` + `seed`) and only add fields you actually changed. On a 400/422 the client retries a set of progressively smaller payloads and reports which one worked. |
 | `422` after touching CFG | `slat_cfg_scale` / `ss_cfg_scale` are `exclusiveMinimum: 1.0`, so `1` is invalid. | Both are clamped to `1.05 … 10` server-side; the sliders can no longer produce an invalid value. |
+| Mesh looks like a cousin of the photo, not a twin | The hosted preview refuses user photos, so the forge builds from the vision layer's description. | The layer report labels the asset **from description**. Set `NVIDIA_TRELLIS_INFER_URL` to your own TRELLIS NIM for photo-exact meshes. |
 | `422` `Expected: example_id, got: base64` | The hosted gateway wants an NVCF asset reference, not an inline data URL (or the function only exposes catalog examples for that account). | Images are uploaded to NVCF asset storage automatically and referenced by id; if the gateway still refuses, the error card explains the three escape hatches (self-host, Direct text → 3D, playground). |
 | `422` on a big upload | TRELLIS expects ~1 MP. A 597×335 screenshot is 0.2 MP and not square. | Uploads are re-fitted into a 1024² JPEG (upscaling allowed) before sending. |
 | `422`/weird mesh from a scene photo | Background, planet, glows confuse the reconstruction. | Auto-matte keeps the centred object only; toggle it off to send the raw frame. The preview shows the difference. |

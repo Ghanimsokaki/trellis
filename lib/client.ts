@@ -138,6 +138,8 @@ export async function requestMesh(
     imageModel?: string | null;
     conceptPrompt?: string | null;
     settings: GenSettings;
+    /** set false to skip the resolve layer's web search */
+    search?: boolean;
   },
   signal: AbortSignal,
 ): Promise<{ blob: Blob; meta: MeshMeta }> {
@@ -146,6 +148,33 @@ export async function requestMesh(
   const header = response.headers.get("x-trellis-meta");
   const meta = header ? decodeMeta(header) : null;
   return { blob, meta: meta ?? fallbackMeta(blob.size) };
+}
+
+export type ViewsResponse = {
+  views: Array<{ dataUrl: string; label: string }>;
+  model: string;
+  mode: "native" | "hosted" | "off";
+  skipped: string | null;
+  elapsedMs: number;
+};
+
+/** Ask Kontext for extra camera angles of the same object. */
+export async function requestViews(
+  payload: { image: string; subject?: string; material?: string; count?: number; seed?: number },
+  signal: AbortSignal = new AbortController().signal,
+): Promise<ViewsResponse> {
+  // Kontext edits can take a while, but they must not outlive a Vercel function.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 180_000);
+  const onAbort = () => controller.abort();
+  signal.addEventListener("abort", onAbort);
+  try {
+    const response = await postJson("/api/views", payload, controller.signal);
+    return (await response.json()) as ViewsResponse;
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", onAbort);
+  }
 }
 
 export type EnhanceResponse = {

@@ -58,6 +58,11 @@ type Props = {
   extraViews: PreparedImage[];
   onAddView: (file: File) => void;
   onRemoveView: (index: number) => void;
+  /** Kontext renders extra camera angles of the uploaded photo */
+  onSynthesizeViews: () => void;
+  synthesizing: boolean;
+  synthNote: string | null;
+  viewSynthesis: "native" | "hosted" | "off";
   busy: boolean;
   stages: PipelineStage[];
   elapsedMs: number;
@@ -66,6 +71,8 @@ type Props = {
   onRun: () => void;
   onCancel: () => void;
   configured: boolean;
+  /** "native" = the photo itself conditions TRELLIS; "caption" = described first. */
+  trellisImageMode: "native" | "caption";
   imageModel: string;
   imageModels: string[];
   onImageModelChange: (id: string) => void;
@@ -163,6 +170,10 @@ export function ControlDeck(props: Props) {
     extraViews,
     onAddView,
     onRemoveView,
+    onSynthesizeViews,
+    synthesizing,
+    synthNote,
+    viewSynthesis,
     busy,
     stages,
     elapsedMs,
@@ -171,6 +182,7 @@ export function ControlDeck(props: Props) {
     onRun,
     onCancel,
     configured,
+    trellisImageMode,
     imageModel,
     imageModels,
     onImageModelChange,
@@ -360,7 +372,7 @@ export function ControlDeck(props: Props) {
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={image.dataUrl} alt="Prepared reference" className="h-full w-full object-contain" />
                 <span className="absolute left-2 top-2 rounded-full border border-lime-glow/30 bg-ink-950/80 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] text-lime-glow">
-                  what TRELLIS sees
+                  {trellisImageMode === "native" ? "what TRELLIS sees" : "vision layer input"}
                 </span>
                 <button
                   type="button"
@@ -384,6 +396,17 @@ export function ControlDeck(props: Props) {
                   {image.width}×{image.height}
                 </span>
               </div>
+
+              {trellisImageMode === "caption" ? (
+                <div className="border-t border-white/[0.06] px-3 py-2">
+                  <p className="text-[10.5px] leading-relaxed text-amber-200/80">
+                    NVIDIA&apos;s hosted TRELLIS preview only reconstructs its own catalogue images. The forge reads this
+                    photo with a vision model and rebuilds it from that description — set{" "}
+                    <span className="mono text-[10px] text-amber-100">NVIDIA_TRELLIS_INFER_URL</span> for photo-exact
+                    meshes.
+                  </p>
+                </div>
+              ) : null}
 
               <div className="border-t border-white/[0.06] px-3 py-2.5">
                 <div className="flex items-center justify-between">
@@ -625,10 +648,45 @@ export function ControlDeck(props: Props) {
                     <span className="text-lg leading-none">+</span>
                   </button>
                 ) : null}
-                <p className="ml-1 max-w-[10rem] text-[10px] leading-snug text-mist-500">
+                {extraViews.length < 2 && trellisImageMode === "native" ? (
+                  <button
+                    type="button"
+                    onClick={onSynthesizeViews}
+                    disabled={synthesizing || busy}
+                    className="chip h-12 shrink-0 px-2 text-[10.5px] leading-tight"
+                    title="Ask FLUX.1-Kontext for a left-side and rear view of this same object"
+                  >
+                    {synthesizing ? (
+                      <span className="flex items-center gap-1">
+                        <IconSpinner className="h-3 w-3 animate-spin" />
+                        angles…
+                      </span>
+                    ) : (
+                      <span className="flex flex-col items-center">
+                        <IconSparkles className="h-3.5 w-3.5" />
+                        synth views
+                      </span>
+                    )}
+                  </button>
+                ) : null}
+                <p className="ml-1 max-w-[9rem] text-[10px] leading-snug text-mist-500">
                   TRELLIS averages up to 8 views — front + top + side fixes nacelle spacing on ships.
                 </p>
               </div>
+              {synthNote ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-amber-200/80">{synthNote}</p>
+              ) : trellisImageMode !== "native" ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-mist-500">
+                  Extra views (yours or synthesized) only reach TRELLIS when it can take the photo — self-host TRELLIS
+                  to use them.
+                </p>
+              ) : viewSynthesis === "hosted" ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-mist-500">
+                  <span className="mono">synth views</span> uses FLUX.1-Kontext — the hosted preview edits only its own
+                  catalogue images, so point <span className="mono">NVIDIA_KONTEXT_URL</span> at a self-hosted Kontext
+                  NIM.
+                </p>
+              ) : null}
             </div>
           ) : null}
 
