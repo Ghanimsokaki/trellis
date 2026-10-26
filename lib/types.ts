@@ -38,6 +38,8 @@ export type MeshMeta = {
   bytes: number;
   requestId: string | null;
   createdAt: string;
+  /** How the reference image reached hosted TRELLIS: NVCF asset upload or inline base64. */
+  imageRef?: "asset" | "inline";
 };
 
 export type ConceptResponse = {
@@ -59,6 +61,9 @@ export type HealthResponse = {
   imageModels: string[];
   apiBase: string;
   maxDurationSeconds: number;
+  /** Where reference images are sent: NVCF asset storage, or inline for self-hosted. */
+  imageTransport: "asset" | "inline";
+  assetsBase: string;
 };
 
 export type StepState = "idle" | "active" | "done" | "error";
