@@ -19,6 +19,8 @@ type GenerateBody = {
   settings?: Partial<GenSettings>;
   /** set false to skip the resolve layer's web search */
   search?: boolean;
+  /** set false to skip Kontext view synthesis */
+  views?: boolean;
   /** set false to bypass the layered forge (single-shot TRELLIS call) */
   layered?: boolean;
 };
@@ -86,6 +88,7 @@ export async function POST(request: Request) {
       imageModel: mode === "image" ? body.imageModel ?? null : null,
       conceptPrompt: body.conceptPrompt ?? null,
       search: body.search,
+      views: body.views,
     });
 
     const filename = `trellis-${meta.seed || "random"}-${Date.now().toString(36)}.glb`;

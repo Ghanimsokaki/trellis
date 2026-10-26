@@ -58,6 +58,11 @@ type Props = {
   extraViews: PreparedImage[];
   onAddView: (file: File) => void;
   onRemoveView: (index: number) => void;
+  /** Kontext renders extra camera angles of the uploaded photo */
+  onSynthesizeViews: () => void;
+  synthesizing: boolean;
+  synthNote: string | null;
+  viewSynthesis: "native" | "hosted" | "off";
   busy: boolean;
   stages: PipelineStage[];
   elapsedMs: number;
@@ -165,6 +170,10 @@ export function ControlDeck(props: Props) {
     extraViews,
     onAddView,
     onRemoveView,
+    onSynthesizeViews,
+    synthesizing,
+    synthNote,
+    viewSynthesis,
     busy,
     stages,
     elapsedMs,
@@ -639,10 +648,45 @@ export function ControlDeck(props: Props) {
                     <span className="text-lg leading-none">+</span>
                   </button>
                 ) : null}
-                <p className="ml-1 max-w-[10rem] text-[10px] leading-snug text-mist-500">
+                {extraViews.length < 2 && trellisImageMode === "native" ? (
+                  <button
+                    type="button"
+                    onClick={onSynthesizeViews}
+                    disabled={synthesizing || busy}
+                    className="chip h-12 shrink-0 px-2 text-[10.5px] leading-tight"
+                    title="Ask FLUX.1-Kontext for a left-side and rear view of this same object"
+                  >
+                    {synthesizing ? (
+                      <span className="flex items-center gap-1">
+                        <IconSpinner className="h-3 w-3 animate-spin" />
+                        angles…
+                      </span>
+                    ) : (
+                      <span className="flex flex-col items-center">
+                        <IconSparkles className="h-3.5 w-3.5" />
+                        synth views
+                      </span>
+                    )}
+                  </button>
+                ) : null}
+                <p className="ml-1 max-w-[9rem] text-[10px] leading-snug text-mist-500">
                   TRELLIS averages up to 8 views — front + top + side fixes nacelle spacing on ships.
                 </p>
               </div>
+              {synthNote ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-amber-200/80">{synthNote}</p>
+              ) : trellisImageMode !== "native" ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-mist-500">
+                  Extra views (yours or synthesized) only reach TRELLIS when it can take the photo — self-host TRELLIS
+                  to use them.
+                </p>
+              ) : viewSynthesis === "hosted" ? (
+                <p className="mt-1.5 text-[10px] leading-relaxed text-mist-500">
+                  <span className="mono">synth views</span> uses FLUX.1-Kontext — the hosted preview edits only its own
+                  catalogue images, so point <span className="mono">NVIDIA_KONTEXT_URL</span> at a self-hosted Kontext
+                  NIM.
+                </p>
+              ) : null}
             </div>
           ) : null}
 

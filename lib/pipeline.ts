@@ -17,6 +17,7 @@
  * reconstruction of the description — labelled as such in the UI.
  */
 import { NimError, generateMesh, isSelfHosted, normalizeSettings } from "./nim";
+import { synthesizeViews, viewSynthesisCapability } from "./synth";
 import { searchCompatible, toSources } from "./search";
 import { analyzeImage, fitPrompt, specFromPrompt } from "./vision";
 import type {
@@ -38,6 +39,8 @@ export type ForgeOptions = {
   conceptPrompt?: string | null;
   /** Set false to skip the resolve layer's web search for this run. */
   search?: boolean;
+  /** Set false to skip Kontext view synthesis for this run. */
+  views?: boolean;
   timeoutMs?: number;
 };
 
@@ -192,12 +195,47 @@ export async function runLayeredForge(
   const wantsNative = selfHosted || tryHostedImage();
   let route: ForgeRoute = wantsNative ? "image-native" : "caption-bridge";
 
+  // --------------------------------------------- 2b. synthesized extra views
+  // Only image-conditioned generations benefit, and TRELLIS wants angles it can
+  // actually use. Kontext turns the photo into sibling viewpoints.
+  const synthesized: string[] = [];
+  const viewCapability = viewSynthesisCapability();
+  if (route !== "image-native") {
+    if (options.views !== false) {
+      recorder.skip("views", "Synthesize views", "only used when the photo conditions the mesh (self-hosted TRELLIS)");
+    }
+  } else if (options.views === false) {
+    recorder.skip("views", "Synthesize views", "turned off for this run");
+  } else if (viewCapability.mode === "off") {
+    recorder.skip("views", "Synthesize views", "off (NVIDIA_SYNTH_VIEWS=off)");
+  } else {
+    const started = Date.now();
+    const synth = await synthesizeViews(primary, spec, {
+      count: Math.min(viewCapability.maxViews, 2),
+      seed: settings.seed || undefined,
+      timeoutMs: Math.min(options.timeoutMs ?? 120_000, 120_000),
+    });
+    synthesized.push(...synth.views.map((view) => view.dataUrl));
+    recorder.layers.push({
+      id: "views",
+      label: "Synthesize views",
+      state: synth.views.length > 0 ? "done" : "skipped",
+      detail:
+        synth.views.length > 0
+          ? `${synth.views.length} extra angle${synth.views.length === 1 ? "" : "s"} from ${synth.model.split("/").pop()} (${synth.views.map((view) => view.label).join(", ")})${synth.skipped ? ` — ${synth.skipped}` : ""}`
+          : synth.skipped ?? "no extra angles produced",
+      ms: Date.now() - started,
+    });
+  }
+
+  const allViews = [primary, ...synthesized, ...extraViews].slice(0, 4);
+
   const forgeNative = async () =>
     generateMesh(
       {
         mode: "image",
         image: primary,
-        images: extraViews.length > 0 ? [primary, ...extraViews] : undefined,
+        images: allViews.length > 1 ? allViews : undefined,
         prompt: input.prompt ?? null,
       },
       settings,
@@ -214,7 +252,7 @@ export async function runLayeredForge(
         id: "forge",
         label: "Forge",
         state: "done",
-        detail: `${describeRoute(route, selfHosted)}${extraViews.length > 0 ? ` · ${extraViews.length + 1} views` : ""}`,
+        detail: `${describeRoute(route, selfHosted)}${allViews.length > 1 ? ` · ${allViews.length} views` : ""}`,
         ms: Date.now() - started,
       });
     } catch (error) {
@@ -272,6 +310,7 @@ export async function runLayeredForge(
       spec: { ...spec, prompt: fitPrompt(spec.prompt, spec.subject) },
       sources,
       visionModel,
+      synthesizedViews: synthesized.length,
     },
   };
 }

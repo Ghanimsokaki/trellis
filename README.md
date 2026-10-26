@@ -112,6 +112,9 @@ Node.js route handler.
 | `NVIDIA_CHAT_BASE` | | `https://integrate.api.nvidia.com/v1` | OpenAI-compatible base for prompt enhancement |
 | `NVIDIA_ENHANCE_MODEL` | | `meta/llama-3.1-8b-instruct` | Chat model used by **Enhance** |
 | `NVIDIA_MAX_DURATION` | | `300` | Cosmetic; shown in the footer |
+| `NVIDIA_KONTEXT_URL` | | — | Self-hosted Kontext NIM (`http://host:8000/v1/infer`) used by **Synthesize views**; the hosted preview only edits catalogue images |
+| `NVIDIA_SYNTH_VIEWS` | | `auto` | `off` disables Kontext view synthesis |
+| `NVIDIA_SYNTH_VIEW_COUNT` | | `2` | How many extra angles to render (1–4) |
 | `NVIDIA_VISION_MODEL` | | `meta/llama-3.2-11b-vision-instruct` | Vision NIM used by the **Perceive** layer |
 | `NVIDIA_TRELLIS_IMAGE_MODE` | | `auto` | `always` = attempt hosted image mode before the caption bridge |
 | `TRELLIS_SEARCH` | | `auto` | `off` skips the **Resolve** layer's web search |
@@ -133,13 +136,14 @@ cannot be lifted to a mesh on the hosted endpoint — so the app runs it through
 | --- | --- | --- |
 | **Perceive** | Reads the photo: subject, silhouette, parts, palette, plus a ≤77-char prompt and web queries | `meta/llama-3.2-11b-vision-instruct` (chat NIM) |
 | **Resolve** | Searches the web for more references and matching 3D models (Brave / Tavily / Serper, or keyless DuckDuckGo) | search provider, optional |
-| **Forge** | TRELLIS image mode with the photo (self-hosted only), else TRELLIS text mode on the description | `microsoft/trellis` |
+| **Synthesize views** | Optional: turns the photo into extra camera angles (left side, rear) so TRELLIS has more than one view — self-hosted Kontext only in practice | `black-forest-labs/flux.1-kontext-dev` |
+| **Forge** | TRELLIS image mode with the photo **and the synthesized angles** (self-hosted only), else TRELLIS text mode on the description | `microsoft/trellis` |
 | **Report** | Route, fidelity, per-layer timings and the references found, shown in the viewport | — |
 
 Fidelity is reported, not implied:
 
-- **photo-exact** — `NVIDIA_TRELLIS_INFER_URL` points at your own TRELLIS NIM; the photo (and any extra views)
-  condition the mesh.
+- **photo-exact** — `NVIDIA_TRELLIS_INFER_URL` points at your own TRELLIS NIM; the photo (plus any uploaded or
+  Kontext-synthesized angles, up to 4 views) conditions the mesh.
 - **from description** — hosted preview; the vision layer's description drives a text-mode mesh.
 - **prompt → mesh** — text-only generation.
 
@@ -163,8 +167,9 @@ browser ──► /api/generate ──► ai.api.nvidia.com/v1/genai/microsoft/t
 | --- | --- | --- |
 | `GET /api/health` | — | `{ configured, authVariable, trellisModel, imageModel, imageModels, apiBase, maxDurationSeconds }` |
 | `POST /api/concept` | `{ prompt, settings, imageModel }` | `{ image, prompt, rawPrompt, seed, model, elapsedMs }` |
+| `POST /api/views` | `{ image, subject?, material?, count?, seed? }` | `{ views: [{ dataUrl, label }], model, mode, skipped, elapsedMs }` |
 | `POST /api/enhance` | `{ prompt, offline? }` | `{ prompt, original, model, elapsedMs, offline, addedShapeWords, fallbackReason? }` — always `200`: the LLM path degrades to the offline composer |
-| `POST /api/generate` | `{ mode: "text" \| "image", prompt?, image?, engine, imageModel?, conceptPrompt?, settings }` | binary **GLB** (`model/gltf-binary`) with generation metadata in `X-Trellis-Meta` (base64 JSON) |
+| `POST /api/generate` | `{ mode: "text" \| "image", prompt?, image?, images?, engine, imageModel?, conceptPrompt?, settings, search?, views? }` | binary **GLB** (`model/gltf-binary`) with generation metadata in `X-Trellis-Meta` (base64 JSON) |
 
 TRELLIS request fields map straight to the NIM schema: `mode`, `image`/`prompt`, `seed`,
 `slat_cfg_scale`, `ss_cfg_scale`, `slat_sampling_steps`, `ss_sampling_steps`.

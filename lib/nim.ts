@@ -298,7 +298,7 @@ async function pollNvcf(requestId: string, key: string, deadline: number, label:
   });
 }
 
-async function callNim(
+export async function callNim(
   path: string,
   body: Record<string, unknown>,
   options: { timeoutMs: number; label: string; retries?: number; allowNoKey?: boolean; headers?: Record<string, string> },
@@ -547,6 +547,45 @@ async function uploadAsset(
 
 /** Base URL of NVCF asset storage (reported by /api/health). */
 export const ASSETS_API_BASE = ASSETS_BASE;
+
+export type HostedImageInput = {
+  /** value to put in the request's `image` field */
+  value: string;
+  /** headers that must accompany the reference (empty for inline) */
+  headers: Record<string, string> | undefined;
+  transport: "asset" | "inline";
+};
+
+/**
+ * Prepare an image for a genai call.
+ *
+ * Self-hosted containers take inline data URLs. Hosted functions cap inline
+ * base64 at ~180 KB and some only accept NVCF asset references, so those get an
+ * upload first. Callers can still fall back to `transport: "inline"`.
+ */
+export async function hostedImageInput(
+  dataUrl: string,
+  options: { hosted: boolean; timeoutMs?: number } = { hosted: false },
+): Promise<HostedImageInput> {
+  if (!options.hosted) {
+    return { value: dataUrl, headers: undefined, transport: "inline" };
+  }
+
+  const ref = parseDataUrl(dataUrl);
+  if (!ref) return { value: dataUrl, headers: undefined, transport: "inline" };
+
+  const bytes = new Uint8Array(Buffer.from(ref.base64, "base64"));
+  try {
+    const asset = await uploadAsset(bytes, ref.mime, { timeoutMs: options.timeoutMs ?? 60_000 });
+    return {
+      value: `data:${ref.mime};asset_id,${asset.assetId}`,
+      headers: { "NVCF-INPUT-ASSET-REFERENCES": asset.assetId },
+      transport: "asset",
+    };
+  } catch {
+    return { value: dataUrl, headers: undefined, transport: "inline" };
+  }
+}
 
 /**
  * How the image is referenced for a hosted TRELLIS call.

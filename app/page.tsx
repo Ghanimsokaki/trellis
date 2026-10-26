@@ -10,6 +10,7 @@ import {
   resolveKey,
 } from "@/lib/nim";
 import { searchConfigured } from "@/lib/search";
+import { VIEW_MODEL, viewSynthesisCapability } from "@/lib/synth";
 import type { HealthResponse } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
@@ -32,6 +33,8 @@ export default function Home() {
     trellisImageMode: selfHosted ? "native" : "caption",
     visionModel: VISION_MODEL,
     searchProvider: searchConfigured().provider,
+    viewSynthesis: viewSynthesisCapability().mode,
+    viewModel: VIEW_MODEL,
   };
 
   return <Studio initialHealth={initialHealth} />;

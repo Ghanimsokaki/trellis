@@ -9,6 +9,7 @@ import {
   resolveKey,
 } from "@/lib/nim";
 import { searchConfigured } from "@/lib/search";
+import { VIEW_MODEL, viewSynthesisCapability } from "@/lib/synth";
 import type { HealthResponse } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -34,6 +35,8 @@ export function GET() {
     trellisImageMode: selfHosted ? "native" : "caption",
     visionModel: VISION_MODEL,
     searchProvider: searchConfigured().provider,
+    viewSynthesis: viewSynthesisCapability().mode,
+    viewModel: VIEW_MODEL,
   };
 
   return Response.json(body, { headers: { "cache-control": "no-store" } });
